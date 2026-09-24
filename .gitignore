@@ -1,0 +1,9 @@
+# 构建工具链（体积大，不入库）
+build/sdk/
+build/out/
+build/keystore/
+
+# 构建产物
+*.apk
+*.hap
+*.idsig
