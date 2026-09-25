@@ -417,6 +417,35 @@ v1.0.12 的 `reconnect()` 第一句就是 `if (adb.isConnected()) return true;` 
 
 > 通用教训：**判断"连接是否还活着"不能看 `isConnected()`，必须发一个真实的小请求（或依赖读写异常）**。
 
+
+## v1.0.14 / v1.0.15（2026-09-26 凌晨）：杆机"授权给副驾后主驾桌面看不到应用"的真因 = launcher 缓存
+
+实机现象：把已装在主驾(12)的网易爆米花 / 箭头音乐「授权给副驾(13)」后，**主驾桌面看不到**这两个应用；
+改为"12+13 同时授权"后主驾仍看不到。
+
+**诊断结论（车机实测数据）**：
+```
+· user 12：pm path 有 ✅  ceDataInode=3965256 installed=true hidden=false stopped=false ...
+· user 13：pm path 有 ✅  ceDataInode=3973129 installed=true hidden=false stopped=false ...
+· user 0/10/11：installed=false（本来就没装）
+```
+⇒ **包状态完全正常**，问题是**车机 launcher 的应用列表缓存**：`pm install-existing --user N` 之后桌面不重建列表。
+
+**解决**：`am force-stop --user <uid> com.flyme.auto.launcher` + 重新拉起 → **用户实测"重启 launcher 好了"** ✅
+
+**固化为工具能力**：
+- v1.0.14 新增「诊断：该应用在各空间的安装状态」（逐空间 `pm path` + `dumpsys` 的 installed/enabled/hidden/stopped）与「刷新主驾桌面（重启 launcher）」；
+- v1.0.15 让**授权 / 取消授权 / 彻底卸载后自动刷新对应空间桌面**（不用再手动点），并修掉诊断输出的排版问题（按行扫描 `User N:` 段 + 同空间去重）。
+
+## v1.0.13 实机确认：真重连生效 ✅
+
+```
+[+25s] 连接被中断（Software caused connection abort）→ 自动重连并重试 …
+[+25s] 已重连 172.22.13.66:5555（实测通过；轨迹：… 凭已存密钥签名通过）
+```
+⇒ `dead` 标志 + "无条件关旧连接 → 直连上次 IP → `echo k` 实测验证"这套修法在车上成立：
+断连后**自己回来且不需要重新授权**。也再次印证：**判断连接存活不能看 `Socket.isConnected()`**。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）

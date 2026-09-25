@@ -1497,33 +1497,46 @@ public class MainActivity extends Activity {
                     String all = sh("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
                     sb.append("· pm list packages -u：").append(all.length() == 0 ? "无记录" : all).append("\n");
                     String full = sh("dumpsys package " + pkg + " 2>/dev/null", 60000);
-                    // 抓取每个 "User N:" 段的关键字段
-                    java.util.regex.Matcher m = java.util.regex.Pattern
-                            .compile("User (\\d+):([^\\n]*)\\n((?:\\s+[a-zA-Z]+=.*\\n)*)").matcher(full);
-                    int found = 0;
-                    while (m.find()) {
-                        found++;
-                        String uid = m.group(1);
-                        String head = m.group(2).trim();
-                        String body = m.group(3);
-                        String flags = "";
-                        for (String line : body.split("\\n")) {
-                            String t = line.trim();
-                            if (t.startsWith("installed=") || t.startsWith("enabled=") || t.startsWith("hidden=")
-                                    || t.startsWith("stopped=") || t.startsWith("suspended=")
-                                    || t.startsWith("installReason=") || t.startsWith("stopped=")) {
-                                flags += t + "  ";
+                    // 按行扫描 "User N:" 段，取紧随其后的 installed=/enabled=/hidden=/stopped= 字段（同一空间只打一次）
+                    java.util.LinkedHashMap<String, String> perUser = new java.util.LinkedHashMap<String, String>();
+                    String cur = null;
+                    StringBuilder flags = null;
+                    for (String raw : full.split("\\n")) {
+                        String line = raw.trim();
+                        if (line.startsWith("User ") && line.contains(":")) {
+                            String uid = line.substring(5, line.indexOf(':')).trim();
+                            if (!perUser.containsKey(uid)) {
+                                perUser.put(uid, "");
+                                cur = uid;
+                                flags = new StringBuilder();
+                                String tail = line.substring(line.indexOf(':') + 1).trim();
+                                if (tail.length() > 0) flags.append(tail).append("  ");
+                                perUser.put(uid, flags.toString());
+                            } else {
+                                cur = null;   // 同一空间重复段，跳过
                             }
+                            continue;
                         }
-                        boolean pathOk = adb.shell("pm path --user " + uid + " " + pkg + " 2>/dev/null", 30000)
-                                .contains("package:");
-                        sb.append("· user ").append(uid).append("：")
-                                .append(pathOk ? "pm path 有 ✅" : "pm path 无 ❌")
-                                .append(head.length() == 0 ? "" : "  ").append(head).append("\n")
-                                .append("    ").append(flags.length() == 0 ? "（未读到字段）" : flags).append("\n");
+                        if (cur != null && flags != null && line.contains("=")
+                                && (line.startsWith("installed=") || line.startsWith("enabled=")
+                                || line.startsWith("hidden=") || line.startsWith("stopped=")
+                                || line.startsWith("suspended=") || line.startsWith("installReason=")
+                                || line.startsWith("ceDataInode=") || line.startsWith("notLaunched="))) {
+                            flags.append(line).append("  ");
+                            perUser.put(cur, flags.toString());
+                        }
                     }
-                    if (found == 0) {
+                    if (perUser.isEmpty()) {
                         sb.append("（dumpsys 里没有 User 段 —— 该包在车机上没有安装记录）\n");
+                    } else {
+                        for (java.util.Map.Entry<String, String> e2 : perUser.entrySet()) {
+                            boolean pathOk = sh("pm path --user " + e2.getKey() + " " + pkg + " 2>/dev/null", 30000)
+                                    .contains("package:");
+                            sb.append("· user ").append(e2.getKey()).append("：")
+                                    .append(pathOk ? "pm path 有 ✅" : "pm path 无 ❌").append("\n    ")
+                                    .append(e2.getValue().trim().length() == 0 ? "（无字段）" : e2.getValue().trim())
+                                    .append("\n");
+                        }
                     }
                     sb.append("提示：installed=true 而桌面不显示 → 是桌面（launcher）显示/缓存问题，点「刷新主驾桌面」或重启车机；")
                             .append("installed=false → 对该空间再点一次「授权到选中空间」。");
@@ -1540,6 +1553,19 @@ public class MainActivity extends Activity {
         if (selectedPkg != null && selectedPkg.length() > 0) return selectedPkg;
         if (pkgInput != null) return pkgInput.getText().toString().trim();
         return "";
+    }
+
+    /** 静默刷新某空间的桌面（授权/卸载后自动调用）。 */
+    private void refreshLauncherQuiet(int uid) {
+        try {
+            sh("am force-stop --user " + uid + " com.flyme.auto.launcher 2>&1", 20000);
+            Thread.sleep(800);
+            sh("am start --user " + uid
+                    + " -n com.flyme.auto.launcher/com.flyme.auto.launcher.ui.main.LauncherActivity 2>&1", 20000);
+            log("已刷新空间 " + uid + " 的桌面");
+        } catch (Exception e) {
+            log("刷新空间 " + uid + " 的桌面失败：" + nz(e.getMessage()));
+        }
     }
 
     /**
@@ -1631,6 +1657,9 @@ public class MainActivity extends Activity {
                         sb.append("诊断：无预置同名包、也无残留记录；各空间已清理并复核，可直接回卡片②重装。\n");
                     }
                     setStatus(left.length() == 0 ? "已彻底卸载：" + pkg : "仍有残留：" + pkg);
+                    for (int i = 0; i < deviceUsers.size(); i++) {
+                        refreshLauncherQuiet(deviceUsers.get(i).intValue());
+                    }
                     log(sb.toString() + (left.length() == 0
                             ? "\n现在可以回卡片②重新安装改造版了。"
                             : "\n若仍失败，请把这段日志发我。"));
@@ -1670,6 +1699,12 @@ public class MainActivity extends Activity {
                     }
                 }
                 setStatus((grant ? "授权" : "取消授权") + "完成：" + pkg);
+                // 这类车机的桌面列表有缓存：授权/卸载后不刷新，桌面可能看不到变化（实测需重启 launcher）
+                for (Integer u : uids) {
+                    refreshLauncherQuiet(u.intValue());
+                }
+                sb.append("\n已自动刷新桌面：").append(uids)
+                        .append("（若桌面仍无变化，可点「刷新主驾桌面」或重启车机）");
                 log(sb.toString());
             }
         }).start();
