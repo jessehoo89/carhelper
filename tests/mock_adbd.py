@@ -255,6 +255,7 @@ class Adbd(object):
 
     # ---- sync 服务
     def sync_service(self, c, local):
+        self.silent = False   # 每个 sync 服务重置（SILENT 只对含 SILENT 的路径生效）
         st = Stream(c, local)
         while True:
             sid, plen = struct.unpack('<II', st.read_exact(8))
@@ -272,10 +273,11 @@ class Adbd(object):
                     self.sync_fail(st, 'missing , in ID_SEND_V1')
                     return
                 mode = c_strtoul(name[comma + 1:])
-                log('SEND path=%s mode=0%o' % (path, mode))
+                self.silent = 'SILENT' in path
+                log('SEND path=%s mode=0%o%s' % (path, mode, '  [静默模式：不发任何 sync 应答]' if self.silent else ''))
                 if mode != 0o644:
                     log('!! 权限不是 0644 (%o)' % mode)
-                self.sync_okay(st)
+                # 现代 adbd（daemon/file_sync_service.cpp）对 SEND 请求本身**不回任何东西**
                 buf = bytearray()
                 while True:
                     did, size = struct.unpack('<II', st.read_exact(8))
@@ -305,11 +307,17 @@ class Adbd(object):
                 self.sync_fail(st, 'unknown command %s' % hex(sid))
                 return
 
+    silent = False
+
     def sync_okay(self, st):
+        if self.silent:
+            return
         st.write(b'OKAY' + struct.pack('<I', 0))
 
     def sync_fail(self, st, msg):
         log('sync FAIL: %s' % msg)
+        if self.silent:
+            return
         st.write(b'FAIL' + struct.pack('<I', len(msg)) + msg.encode())
 
     # ---- shell 服务
@@ -333,12 +341,25 @@ class Adbd(object):
             out = ('size=%d sha256=%s\n' % (len(b), hashlib.sha256(b).hexdigest())).encode()
         elif cmdline.startswith('echo '):
             out = (cmdline[5:] + '\n').encode()
+        elif 'install' in cmdline and '-S' in cmdline:
+            # 复刻 `cmd package install -S <size>`：从 stdin 读满 size 字节后输出结果
+            toks = cmdline.split()
+            size = int(toks[toks.index('-S') + 1])
+            got = len(stdin)
+            if got == size:
+                out = b'Success\n'
+            else:
+                out = ('Failure [INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES: read %d of %d]\n'
+                       % (got, size)).encode()
         else:
             out = b'mock-ok\n'
         log('shell 输出 %d 字节: %r' % (len(out), out[:60]))
         if out:
             st.write(out)
         st.write(b'')  # 关闭 stdout
+        if 'NOCLSE' in command and cmdline.startswith('cat > '):
+            log('shell 服务结束不发 CLSE（模拟本车机行为）')
+            return
         send_msg(c, CLSE, local, local)
 
 

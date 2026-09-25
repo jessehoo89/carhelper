@@ -343,13 +343,14 @@ public class MainActivity extends Activity {
     }
 
     private final StringBuilder logBuf = new StringBuilder();
+    private long logT0 = System.currentTimeMillis();
 
     /** 追加一条日志（保留最近若干行，便于回看整条链路）。 */
     private void log(final String s) {
         ui.post(new Runnable() {
             public void run() {
                 if (logBuf.length() > 0) logBuf.append("\n");
-                logBuf.append(s);
+                logBuf.append("[+").append((System.currentTimeMillis() - logT0) / 1000).append("s] ").append(s);
                 if (logBuf.length() > 6000) logBuf.delete(0, logBuf.length() - 5000);
                 logView.setText(logBuf.toString());
             }
@@ -360,6 +361,7 @@ public class MainActivity extends Activity {
         ui.post(new Runnable() {
             public void run() {
                 logBuf.setLength(0);
+                logT0 = System.currentTimeMillis();
                 logView.setText("（空）");
             }
         });
@@ -649,7 +651,7 @@ public class MainActivity extends Activity {
                             public InputStream open() throws IOException {
                                 return getContentResolver().openInputStream(uri);
                             }
-                        }, "所选 APK", false, sizeOf(uri));
+                        }, displayName(uri), false, sizeOf(uri));
                     } catch (Exception e) {
                         log("读取所选文件失败：" + e.getMessage());
                     }
@@ -680,99 +682,155 @@ public class MainActivity extends Activity {
         InputStream open() throws IOException;
     }
 
-    private void install(StreamFactory sf, String label, boolean launch, long expectSize) {
+    /**
+     * 安装编排：三种方式依次尝试，任一种成功即返回。
+     *
+     *  ⚠️ 血泪教训（v1.0.2）：
+     *   · 设备的 sync 服务对 SEND 请求**不回任何东西**（AOSP daemon 只在 DONE 后写一次 OKAY），
+     *     旧版每步都等应答 → 干等 60s 报「sync 推送失败: Read timed out」；
+     *   · 服务流结束时设备也可能不发 CLSE → 旧版等到超时误报「安装超时」。
+     *  所以现在**不以应答判定成败，一律以车机上文件大小 / pm install 输出为准**。
+     */
+    private void install(StreamFactory sf, String label, boolean launch, long knownSize) {
+        final long t0 = System.currentTimeMillis();
         String tmp = "/data/local/tmp/carhelper-" + System.currentTimeMillis() + ".apk";
+        final int uid = chosenUser >= 0 ? chosenUser : 0;
+        log("===== 安装「" + label + "」→ " + spaceRowTitle(uid)
+                + (knownSize > 0 ? "（" + (knownSize / 1024) + " KB）" : "（大小未知）") + " =====");
+
+        final long[] lastLog = new long[]{0};
+        AdbClient.Progress prog = new AdbClient.Progress() {
+            public void onBytes(long n) {
+                if (n - lastLog[0] >= 10 * 1024 * 1024) {
+                    lastLog[0] = n;
+                    log("已传输 " + (n / 1048576) + " MB …");
+                }
+            }
+        };
+
+        String out = null;
         try {
-            final int uid = chosenUser >= 0 ? chosenUser : 0;
-            setStatus("正在推送 " + label + " → 空间 " + uid + " …");
-            log("目标空间：" + spaceRowTitle(uid) + "\n开始推送 APK 到车机 " + tmp + " …");
-
-            long pushed;
-            final long[] lastLog = new long[]{0};
-            AdbClient.Progress prog = new AdbClient.Progress() {
-                public void onBytes(long n) {
-                    if (n - lastLog[0] >= 10 * 1024 * 1024) {
-                        lastLog[0] = n;
-                        log("已推送 " + (n / 1048576) + " MB …");
-                    }
+            // ---------- 方式 A：流式安装（与 `adb install` 同一条路：stdin 直喂 pm/cmd，不落临时文件）
+            if (knownSize > 0) {
+                setStatus("正在流式安装 " + label + " …");
+                log("[A] 流式安装：exec:cmd package install -S " + knownSize + " …");
+                String a = adb.streamToService(
+                        "exec:cmd package install -S " + knownSize + " -r --user " + uid,
+                        sf.open(), prog, 180000);
+                if (isInstallOk(a)) {
+                    done(label, uid, launch, a, t0);
+                    return;
                 }
-            };
-
-            InputStream in = sf.open();
-            try {
-                pushed = adb.push(in, tmp, 0644, prog);
-            } catch (IOException e) {
-                log("sync 推送失败：" + e.getMessage() + "\n→ 改用备用通道（shell 流）重新推送 …");
-                try {
-                    in.close();
-                } catch (IOException ignored) {
+                log("[A] 未成功：" + tailOf(a));
+                log("[A2] 改用 pm install -S 再试 …");
+                String a2 = adb.streamToService(
+                        "exec:pm install -S " + knownSize + " -r --user " + uid,
+                        sf.open(), prog, 180000);
+                if (isInstallOk(a2)) {
+                    done(label, uid, launch, a2, t0);
+                    return;
                 }
-                InputStream in2 = sf.open();
-                try {
-                    pushed = adb.pushViaShell(in2, tmp, prog);
-                } finally {
-                    try {
-                        in2.close();
-                    } catch (IOException ignored) {
-                    }
-                }
-            } finally {
-                try {
-                    in.close();
-                } catch (IOException ignored) {
-                }
-            }
-
-            // 落到车机上的文件大小核对（防半截文件导致 pm install 解析失败）
-            String sizeStr = adb.shell("toybox stat -c %s " + tmp + " 2>/dev/null || ls -l " + tmp).trim();
-            long onDevice = firstNumber(sizeStr);
-            log("推送完成：" + pushed + " 字节；车机侧 " + (onDevice >= 0 ? onDevice + " 字节" : sizeStr));
-            if (expectSize > 0 && pushed != expectSize) {
-                log("⚠️ 源文件 " + expectSize + " 字节，实际推送 " + pushed + " 字节（可能被截断或源文件变化）。");
-            }
-            if (onDevice >= 0 && onDevice != pushed) {
-                log("⚠️ 文件大小与推送量不一致，可能被截断（请重试；若反复如此请把日志发我）。");
-            }
-
-            setStatus("正在安装 " + label + " → 空间 " + uid + " …");
-            log("执行 pm install -r --user " + uid + " …");
-            String out = adb.shell("pm install -r --user " + uid + " " + tmp, 300000);
-            if (out.contains("INSTALL_FAILED_TEST_ONLY")) {
-                log("该 APK 带 testOnly 标记，改用 -t 重试 …");
-                out = adb.shell("pm install -r -t --user " + uid + " " + tmp, 300000);
-            }
-            adb.shell("rm -f " + tmp);
-            String tail = out.trim();
-            if (tail.length() > 600) tail = tail.substring(tail.length() - 600);
-            if (out.contains("Success")) {
-                if (launch) {
-                    adb.shell("am start --user " + uid
-                            + " -n com.carhelper.fullscreen/com.carhelper.fullscreen.MainActivity");
-                    tail += "\n已尝试在车机上拉起全屏工具。";
-                }
-                setStatus(label + " 安装成功（空间 " + uid + " · " + spaceLabel(uid) + "）");
-                log("✅ 安装成功：" + spaceRowTitle(uid) + "\n" + tail
-                        + "\n提示：车机桌面若没出现图标，多半是装到了非当前活跃空间；"
-                        + "可换 " + (activeUser >= 0 ? activeUser : 12) + " 再装一次。");
+                log("[A2] 未成功：" + tailOf(a2));
             } else {
-                setStatus(label + " 安装失败");
-                log("❌ 安装失败：" + spaceRowTitle(uid) + "\n车机返回：\n" + tail + "\n"
-                        + installHint(out));
+                log("[A] 跳过流式安装（未知文件大小）");
             }
+
+            // ---------- 方式 B：shell 流推到 /data/local/tmp 再装（本机已验证能传大文件的通道）
+            setStatus("正在推送 " + label + "（方式 B）…");
+            log("[B] 推送文件：cat > " + tmp + " …");
+            long pushed = adb.pushViaShell(sf.open(), tmp, prog);
+            long onDevice = deviceFileSize(tmp);
+            log("[B] 已推送 " + pushed + " 字节 / 车机侧 " + onDevice + " 字节");
+            if (onDevice > 0 && onDevice == pushed) {
+                out = pmInstall(uid, tmp);
+                if (isInstallOk(out)) {
+                    done(label, uid, launch, out, t0);
+                    return;
+                }
+                log("[B] pm install 未成功：" + tailOf(out));
+            } else {
+                log("[B] 车机侧大小对不上（推送可能被截断）→ 转方式 C");
+            }
+
+            // ---------- 方式 C：sync 推送（容错版，最后兜底）
+            setStatus("正在推送 " + label + "（方式 C）…");
+            log("[C] sync 推送 " + tmp + " …");
+            long pushed2 = adb.push(sf.open(), tmp, 0644, prog);
+            long onDevice2 = deviceFileSize(tmp);
+            log("[C] 已推送 " + pushed2 + " 字节 / 车机侧 " + onDevice2 + " 字节");
+            if (onDevice2 > 0 && onDevice2 == pushed2) {
+                out = pmInstall(uid, tmp);
+                if (isInstallOk(out)) {
+                    done(label, uid, launch, out, t0);
+                    return;
+                }
+            }
+
+            setStatus(label + " 安装失败");
+            log("❌ 三种方式都没装上。车机最后返回：\n" + tailOf(out) + "\n" + installHint(String.valueOf(out)));
         } catch (Exception e) {
+            setStatus("安装异常");
+            String m = String.valueOf(e.getMessage());
+            log("❌ 安装异常（第 " + ((System.currentTimeMillis() - t0) / 1000) + " 秒）：" + m
+                    + "\n若为链路无应答：确认手机仍连着车机热点、离车近一点再试；"
+                    + "若反复失败，请在 HiSH 里跑 `adb shell df /data` 和 `adb shell ls -l /data/local/tmp` 把结果发我。");
+        } finally {
             try {
                 adb.shell("rm -f " + tmp);
             } catch (Exception ignored) {
             }
-            setStatus("安装异常");
-            String m = String.valueOf(e.getMessage());
-            if (e instanceof java.io.InterruptedIOException || m.contains("timed out")
-                    || m.contains("SocketTimeout")) {
-                log("安装超时：手机与车机之间链路中断或被限时。\n请确认手机仍连着车机热点、离车近一些，再重试。");
-            } else {
-                log("安装异常：" + m + "\n（若是连接被中断，请重新点「一键连接车机」——密钥已保存，不会再弹授权框。）");
-            }
         }
+    }
+
+    private void done(String label, int uid, boolean launch, String out, long t0) throws IOException {
+        if (launch) {
+            adb.shell("am start --user " + uid
+                    + " -n com.carhelper.fullscreen/com.carhelper.fullscreen.MainActivity");
+        }
+        setStatus(label + " 安装成功（" + spaceLabel(uid) + "）");
+        log("✅ 安装成功：" + spaceRowTitle(uid)
+                + "（用时 " + ((System.currentTimeMillis() - t0) / 1000) + " 秒）\n" + tailOf(out));
+    }
+
+    /**
+     * 在车机上装一个已推送好的 APK。
+     * 走 streamToService 而不是 shell()：服务流结尾设备可能不发 CLSE，
+     * 这里靠输出里的 Success / Failure 判定结束，天然不依赖 CLSE。
+     */
+    private String pmInstall(int uid, String path) throws IOException {
+        String out = runOnDevice("shell:pm install -r --user " + uid + " " + path, 300000);
+        if (out.contains("INSTALL_FAILED_TEST_ONLY")) {
+            log("该 APK 带 testOnly 标记，改用 -t 重试 …");
+            out = runOnDevice("shell:pm install -r -t --user " + uid + " " + path, 300000);
+        }
+        return out;
+    }
+
+    /** 跑一条不需要 stdin 的车机命令，收集输出直到结果行或超时。 */
+    private String runOnDevice(String service, int tailWaitMs) throws IOException {
+        return adb.streamToService(service, new java.io.ByteArrayInputStream(new byte[0]), null, tailWaitMs);
+    }
+
+    private static boolean isInstallOk(String out) {
+        return out != null && out.contains("Success");
+    }
+
+    /** 车机上文件的大小（字节），读不到返回 -1。 */
+    private long deviceFileSize(String path) {
+        try {
+            String s = adb.shell("toybox stat -c %s " + path + " 2>/dev/null || ls -l " + path).trim();
+            if (s.length() == 0) return -1;
+            return firstNumber(s);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static String tailOf(String s) {
+        if (s == null) return "（无输出）";
+        String t = s.trim();
+        if (t.length() == 0) return "（无输出）";
+        return t.length() > 500 ? "…" + t.substring(t.length() - 500) : t;
     }
 
     /** 常见 pm install 报错 → 人话建议。 */
@@ -784,14 +842,33 @@ public class MainActivity extends Activity {
         if (out.contains("INSTALL_FAILED_VERSION_DOWNGRADE"))
             return "建议：车机上是更高版本，先卸载旧版或用 -d 降级安装。";
         if (out.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE"))
-            return "建议：车机存储空间不足，先清理。";
+            return "建议：车机存储空间不足（用 HiSH 跑 adb shell df /data 看），先清理。";
         if (out.contains("INSTALL_FAILED_VERIFICATION_FAILURE"))
             return "建议：被车机安装校验拦截，需要改包名重打包后再装。";
         if (out.contains("INSTALL_PARSE_FAILED"))
-            return "建议：APK 解析失败（文件损坏/不完整），请确认推送字节数一致后重试。";
+            return "建议：APK 解析失败（多半是传输被截断），重试一次；仍失败就把上面原文发我。";
         if (out.contains("INSTALL_FAILED_USER_RESTRICTED"))
             return "建议：车机策略限制了安装来源。";
+        if (out.contains("No such file") || out.contains("not found"))
+            return "建议：车机侧临时文件不见了（推送没落地），请重试。";
         return "建议：把上面这段原文发我，我按错误码定位。";
+    }
+
+    /** 取选中文件的显示名，用作日志标签。 */
+    private String displayName(Uri uri) {
+        android.database.Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, null, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (i >= 0 && !c.isNull(i)) return c.getString(i);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? "所选 APK" : last;
     }
 
     private long sizeOf(Uri uri) {

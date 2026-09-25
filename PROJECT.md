@@ -122,9 +122,45 @@ static bool do_send_v1(int s, const std::string& spec, ...) {
 
 联测结果：首次连接走公钥授权 ✅ / shell 通道 ✅ / sync 推送 200KB 逐字节一致 ✅ / shell 兜底 150KB 逐字节一致 ✅ / FAIL 原文透传 ✅ / sync 之后 shell 仍正常 ✅ / 复用持久化密钥不再弹框 ✅。
 
+
+## v1.0.2（2026-09-25 晚）：实机第二次反馈 —— 别再等车机应答
+
+实机（领克900）反馈：v1.0.1 授权只弹一次 ✅、空间标签正确 ✅，但**装不上**：
+日志里 `sync 推送失败: Read timed out` → 回退 shell 流 → `已推送 50 MB…` → `安装超时`。同一台车用 HiSH 的 `adb install --user 12`（streamed install）却能成功。
+
+### 根因（这次是"等错了东西"，AOSP host 端源码为准）
+
+拉 `client/file_sync_client.cpp` 对照，**AOSP 自己的 host 客户端推文件时从不等待任何应答**：
+
+- `SendSmallFile`：把 `SEND_V1{id,path_length}` + `"<路径>,<权限>"` + `DATA` + `DONE` 一次性拼进 buffer，`WriteOrDie(...)` 发完就返回；
+- `SendLargeFileLegacy`：`SendRequest(ID_SEND_V1,…)` → 循环 `WriteOrDie(DATA)` → `WriteOrDie(DONE)`，**全程不读**；
+- 应答是异步的（`deferred_acknowledgements_`），而现代 adbd 的 `daemon/file_sync_service.cpp` 里 `ID_OKAY` **只在 DONE 之后写一次**（`do_send_v1`→`send_impl`→`handle_send_file` 末尾），**对 SEND 请求本身完全不给回复**；
+- 服务流结束时设备也**可能不发 CLSE**。
+
+而 v1.0.0/v1.0.1 的客户端"每个请求都等应答" → 车机不回就干等到 60 秒超时：`sync 推送失败: Read timed out`（SEND 之后等不到 OKAY）、`安装超时`（cat 推送完等不到 CLSE）。数据其实**早就传过去了**，是我们自己在等一个永远不会来的报文。
+
+### 修法：一律以"车机上的事实"判定成败，不以应答为准
+
+1. `push()`（sync）：OPEN 后拿到 remote id 即发 SEND/DATA/DONE，每步只**软等**传输层 OKAY（流控，超时不算错）；结尾给 2.5s 收 FAIL（真被拒才抛错）；`QUIT`+`CLSE` fire-and-forget。
+2. `streamToService(service, src, progress, tailWaitMs)`：通用二进制流（用于 `cat > 文件`、`pm install -S`、`pm install 文件`）。写完 stdin 后**只等一小会儿且不把超时当失败**，收尾判据 = 拿到 `Success`/`Failure`，或"已有输出且静默 >10s"，或到点。
+3. 安装改三方式阶梯，任一种成功即止，**每种的成败都用车机上文件大小 / pm install 输出核对**：
+   - **A 流式安装**（就是 HiSH 里成功的那条路）：`exec:cmd package install -S <size> -r --user N`，stdin 直喂 APK，不落临时文件；失败再试 `pm install -S`。
+   - **B 推送再装**：`shell:cat > /data/local/tmp/xxx.apk` → `stat` 核对字节数 → `pm install -r --user N <path>`。
+   - **C sync 推送再装**：容错版 sync → 核对字节数 → `pm install`。
+4. `pmInstall()` 也走 `streamToService`（不依赖 CLSE）。
+5. 日志加 `[+Ns]` 时间戳、安装时**打印文件名与大小**（上一版没写装的是哪个包，用户看不出在装谁）；`sizeOf` 读不到就不走 A 方式。
+
+### 新增回归测试（`tests/`，13 项全绿）
+
+`mock_adbd.py` 现在按**真机行为**复刻：SEND 不回任何东西；`SILENT` 路径完全静默（模拟本车机）；`NOCLSE` 服务结束不发 CLSE；支持 `cmd package install -S <n>`（读满 size 才回 Success）。新增断言：
+- 设备对 sync **完全静默**时，180KB 推送不阻塞且内容逐字节一致 ← 直接复现本次实机故障；
+- 服务不发 CLSE 时，shell 推送 1.5s 内返回且内容一致；
+- 流式安装路径（`exec:cmd package install -S`）可用。
+
 ## 待办
 
-- [ ] 实机复验 v1.0.1：二次连接不再弹授权框、装机成功、空间标签正确
+- [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）
+- [ ] 实机复验 v1.0.2：三种安装方式至少一种成功
 - [ ] 大包推送性能：`WRTE` 流控改为窗口化
 - [ ] 后排空间命名按实机校准（不同固件的空间编号可能不同）
 - [ ] 装机后校验：`pm path --user N <pkg>` 确认落点

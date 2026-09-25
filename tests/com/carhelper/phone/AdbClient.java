@@ -420,7 +420,6 @@ public class AdbClient {
             return "";
         }
         long until = System.currentTimeMillis() + Math.max(500, tailWaitMs);
-        long lastData = System.currentTimeMillis();
         try {
             while (System.currentTimeMillis() < until) {
                 long left = Math.max(300, Math.min(5000, until - System.currentTimeMillis()));
@@ -428,16 +427,13 @@ public class AdbClient {
                 Msg m;
                 try {
                     m = read();
-                    lastData = System.currentTimeMillis();
                 } catch (java.net.SocketTimeoutException te) {
-                    // 收尾判据：拿到 Success/Failure → 结束；或已有输出且静默 >10s → 当作说完了；
-                    // 完全没输出则继续等（pm install 装大包时会一直不出声）。
                     String soFar = out.toString("UTF-8");
-                    boolean decided = soFar.contains("Success") || soFar.contains("Failure");
-                    boolean idleWithOutput = soFar.length() > 0
-                            && (System.currentTimeMillis() - lastData) > 10000;
-                    if (decided || idleWithOutput || System.currentTimeMillis() >= until) break;
-                    continue;
+                    if (soFar.length() == 0 || (!soFar.contains("Success") && !soFar.contains("Failure"))) {
+                        if (System.currentTimeMillis() >= until) break;
+                        continue;
+                    }
+                    break;
                 }
                 if (m.cmd == A_WRTE && m.arg1 == local) {
                     out.write(m.data);

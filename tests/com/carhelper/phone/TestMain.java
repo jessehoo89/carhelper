@@ -103,6 +103,32 @@ public class TestMain {
         check("车机侧收到的内容与源文件逐字节一致（shell 兜底通道）", info2.contains("size=" + big2.length)
                 && info2.contains(sha256(big2)));
 
+        // ---- 回归：设备对 sync 完全静默（本车机行为）时，推送仍必须完成且内容正确
+        byte[] big3 = new byte[180000];
+        new Random(21).nextBytes(big3);
+        long n4 = adb.push(new ByteArrayInputStream(big3), "/data/local/tmp/SILENT-t4.bin", 0644, null);
+        check("设备对 sync 静默时推送不阻塞 (" + n4 + " 字节)", n4 == big3.length);
+        String info4 = adb.shell("mockinfo /data/local/tmp/SILENT-t4.bin").trim();
+        check("静默模式下内容仍逐字节一致", info4.contains("size=" + big3.length) && info4.contains(sha256(big3)));
+
+        // ---- 回归：服务结束不发 CLSE 时，shell 推送不等超时
+        byte[] big4 = new byte[120000];
+        new Random(22).nextBytes(big4);
+        long t0 = System.currentTimeMillis();
+        long n5 = adb.pushViaShell(new ByteArrayInputStream(big4), "/data/local/tmp/t5-NOCLSE.bin", null);
+        long ms = System.currentTimeMillis() - t0;
+        String info5 = adb.shell("mockinfo /data/local/tmp/t5-NOCLSE.bin").trim();
+        check("不发 CLSE 时 shell 推送立即返回（" + ms + "ms）", ms < 8000 && n5 == big4.length);
+        check("不发 CLSE 时内容仍逐字节一致", info5.contains("size=" + big4.length) && info5.contains(sha256(big4)));
+
+        // ---- 流式安装：exec:cmd package install -S <size>（与 adb install 同路径）
+        byte[] apk = new byte[90000];
+        new Random(33).nextBytes(apk);
+        String inst = adb.streamToService("exec:cmd package install -S " + apk.length + " -r --user 12",
+                new ByteArrayInputStream(apk), null, 20000);
+        System.out.println("  流式安装输出 → " + inst.trim());
+        check("流式安装路径可用（设备回 Success）", inst.contains("Success"));
+
         // ---- 失败路径：车机回 FAIL 时应抛出带原因的异常
         String err = "";
         try {
