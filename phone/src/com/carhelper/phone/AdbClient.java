@@ -82,6 +82,9 @@ public class AdbClient {
 
     private final KeyProvider keys;
 
+    /** 本次握手的认证轨迹（排查"为什么每次都要重新授权"用）。 */
+    public final StringBuilder authTrace = new StringBuilder();
+
     private Socket sock;
     private InputStream in;
     private OutputStream out;
@@ -123,8 +126,10 @@ public class AdbClient {
             if (m.cmd == A_CNXN) {
                 if (m.arg1 > 4096) devMaxData = m.arg1;
                 sock.setSoTimeout(readTimeoutMs);
+                authTrace.append("→ CNXN(设备就绪) ").append(pubkeySent ? "[本次提交过公钥]" : "[凭已存密钥签名通过]");
                 return pubkeySent;
             } else if (m.cmd == A_AUTH) {
+                authTrace.append("AUTH(type=").append(m.arg0).append(",tokenLen=").append(m.len).append(") ");
                 if (m.arg0 == 1 && !sigTried) {
                     // TOKEN：先用持久化的私钥签名（密钥已授权时，一步通过、不弹框）
                     sigTried = true;
@@ -132,8 +137,10 @@ public class AdbClient {
                     byte[] sig = signToken(m.data);
                     if (sig != null) {
                         send(A_AUTH, 2, 0, sig);
+                        authTrace.append("→ 已发签名; ");
                         continue;
                     }
+                    authTrace.append("→ 签名失败; ");
                 }
                 // 签名未被认可（或车机要求公钥）：发公钥，车机屏弹授权框
                 if (pubkeySends >= 3) {
@@ -146,6 +153,7 @@ public class AdbClient {
                 if (keys != null) keys.onAuthRequested();
                 ensureKey();
                 send(A_AUTH, 3, 0, adbPublicKeyBytes());
+                authTrace.append("→ 已发公钥(第").append(pubkeySends).append("次,车机会弹框); ");
             } else {
                 throw new IOException("ADB 握手异常，收到 " + cmdName(m.cmd));
             }
@@ -183,6 +191,18 @@ public class AdbClient {
             }
         } catch (Exception e) {
             throw new RuntimeException("RSA 密钥生成失败: " + e);
+        }
+    }
+
+    /** 本机公钥 blob 的 base64 部分（与车机 adb_keys 里存的那串比对，可判定车机是否记住了我们）。 */
+    public String publicKeyBase64() {
+        try {
+            ensureKey();
+            String s = new String(adbPublicKeyBytes(), "UTF-8");
+            int i = s.indexOf(' ');
+            return i > 0 ? s.substring(0, i) : s;
+        } catch (Exception e) {
+            return "";
         }
     }
 

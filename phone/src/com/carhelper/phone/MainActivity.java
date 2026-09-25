@@ -103,6 +103,8 @@ public class MainActivity extends Activity {
     private final List<Integer> deviceUsers = new ArrayList<Integer>();
     private final List<String> deviceUserNames = new ArrayList<String>();
     private final List<String> allPkgs = new ArrayList<String>();
+    /** 包名 → 它装在哪些用户空间（列表里显示，卸载时用来清残留） */
+    private final java.util.Map<String, List<Integer>> pkgUsers = new java.util.LinkedHashMap<String, List<Integer>>();
     private final List<Integer> pickedSpaces = new ArrayList<Integer>();
     private final List<Integer> targets = new ArrayList<Integer>(); // 可选的安装目标用户空间
 
@@ -205,6 +207,10 @@ public class MainActivity extends Activity {
         LinearLayout c1 = card(root, "① 连接车机", "一键完成：检测热点 → 发现车机 → 连接 ADB");
         c1.addView(btn("一键连接车机", "#1F6FEB", new Runnable() {
             public void run() { oneClickConnect(); }
+        }));
+        c1.addView(gap(8));
+        c1.addView(btn("检查车机是否已记住本机密钥", "#30363D", new Runnable() {
+            public void run() { checkAuthKeys(); }
         }));
 
         // ---------------- 卡片 ② 安装应用 ----------------
@@ -485,6 +491,7 @@ public class MainActivity extends Activity {
                             + "（建议勾选“始终允许”），然后重新点「一键连接车机」。");
                     return;
                 }
+                stepLog("认证轨迹：" + adb.authTrace.toString());
                 stepLog("步骤 3/4 ✅ 已连接（本机 ADB 密钥指纹 " + adb.keyFingerprint() + "）"
                         + (authAsked ? " — 本次已向车机提交公钥，若车机屏弹框请点「允许」" : " — 密钥已被车机认可，无需再授权"));
 
@@ -508,6 +515,54 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /**
+     * 读车机 /data/misc/adb/adb_keys，与本机公钥比对 —— 一条命令就能判定"车机有没有记住我们"。
+     * 判定结果直接决定下一步：没记住 = 授权框里的「始终允许」没勾（或点了拒绝/仅本次）。
+     */
+    private void checkAuthKeys() {
+        if (!ensureConnected()) return;
+        setStatus("正在检查车机已授权公钥 …");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    String mine = adb.publicKeyBase64();
+                    String dump = adb.shell("cat /data/misc/adb/adb_keys 2>&1", 30000).trim();
+                    StringBuilder sb = new StringBuilder("车机 /data/misc/adb/adb_keys：\n");
+                    boolean found = false;
+                    int n = 0;
+                    if (dump.contains("Permission denied") || dump.contains("No such file")
+                            || dump.contains("not found")) {
+                        sb.append("（无法读取：").append(dump).append("）\n");
+                    } else if (dump.length() == 0) {
+                        sb.append("（文件为空 = 车机还没记住任何密钥）\n");
+                    } else {
+                        for (String line : dump.split("\n")) {
+                            String t = line.trim();
+                            if (t.length() == 0) continue;
+                            n++;
+                            String b64 = t.split(" ")[0];
+                            boolean hit = b64.equals(mine);
+                            if (hit) found = true;
+                            sb.append("· ").append(b64.substring(0, Math.min(16, b64.length()))).append("…")
+                                    .append(hit ? "  ← 本机密钥 ✅" : "").append("\n");
+                        }
+                        sb.append("共 ").append(n).append(" 把已授权密钥\n");
+                    }
+                    sb.append("本机公钥前 16 位：").append(mine.substring(0, Math.min(16, mine.length()))).append("…\n");
+                    sb.append("认证轨迹：").append(nz(adb.authTrace.toString())).append("\n");
+                    sb.append(found
+                            ? "结论：车机已记住本机密钥 —— 之后连接不该再弹框；若仍弹，请把这段发我。"
+                            : "结论：车机**没有**本机密钥记录 → 授权框里的「始终允许」没勾（或点成了拒绝/仅本次）。"
+                              + "下次弹框时务必勾上「始终允许」再点「允许」。");
+                    log(sb.toString());
+                    setStatus(found ? "车机已记住本机密钥 ✅" : "车机未记住本机密钥（请勾「始终允许」）");
+                } catch (Exception e) {
+                    log("检查失败：" + e.getMessage());
+                }
+            }
+        }).start();
+    }
+
     private void fail(final String msg) {
         ui.post(new Runnable() {
             public void run() {
@@ -518,9 +573,7 @@ public class MainActivity extends Activity {
     }
 
     private void stepLog(final String s) {
-        ui.post(new Runnable() {
-            public void run() { logView.setText(s); }
-        });
+        log(s);   // 必须走 log()：原来这里直接 setText 会覆盖整块日志，导致中间步骤看不见
     }
 
     /** 采集设备特征 + 用户空间，判定前排/后排，筛出可用安装空间。 */
@@ -1122,12 +1175,26 @@ public class MainActivity extends Activity {
                     rawUserList = seg(info, "USERS=").trim();
                     parseUsers(rawUserList);
 
-                    // 2) 第三方应用
-                    String pkgs = adb.shell("pm list packages -3");
+                    // 2) 第三方应用 —— 必须**按每个用户空间**查！
+                    //     `pm list packages -3` 只看 shell 自己的 user（默认 0），
+                    //     而我们的应用装在 12（活跃空间）→ 直接查会得到 0 个（v1.0.6 的 bug）。
                     allPkgs.clear();
-                    for (String line : pkgs.split("\n")) {
-                        String s = line.trim();
-                        if (s.startsWith("package:")) allPkgs.add(s.substring(8).trim());
+                    pkgUsers.clear();
+                    for (int i = 0; i < deviceUsers.size(); i++) {
+                        int uid = deviceUsers.get(i).intValue();
+                        String out = adb.shell("pm list packages -3 --user " + uid + " 2>/dev/null");
+                        for (String line : out.split("\n")) {
+                            String t = line.trim();
+                            if (!t.startsWith("package:")) continue;
+                            String pk = t.substring(8).trim();
+                            List<Integer> us = pkgUsers.get(pk);
+                            if (us == null) {
+                                us = new ArrayList<Integer>();
+                                pkgUsers.put(pk, us);
+                                allPkgs.add(pk);
+                            }
+                            if (!us.contains(Integer.valueOf(uid))) us.add(Integer.valueOf(uid));
+                        }
                     }
                     Collections.sort(allPkgs);
 
@@ -1208,8 +1275,9 @@ public class MainActivity extends Activity {
         for (final String p : allPkgs) {
             if (f.length() > 0 && !p.toLowerCase().contains(f)) continue;
             if (shown++ >= 120) break;
+            List<Integer> us = pkgUsers.get(p);
             TextView tv = new TextView(this);
-            tv.setText(p);
+            tv.setText(p + (us == null || us.isEmpty() ? "" : "   [空间 " + joinInts(us) + "]"));
             tv.setTextSize(13);
             tv.setPadding(dp(12), dp(10), dp(12), dp(10));
             boolean sel = p.equals(selectedPkg);
@@ -1345,6 +1413,15 @@ public class MainActivity extends Activity {
     private static String netOf(String ip) {
         String[] p = ip.split("\\.");
         return p.length == 4 ? p[0] + "." + p[1] + "." + p[2] + ".0/24" : ip;
+    }
+
+    private static String joinInts(List<Integer> l) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < l.size(); i++) {
+            if (i > 0) sb.append('/');
+            sb.append(l.get(i));
+        }
+        return sb.toString();
     }
 
     private static String join(List<String> l) {
