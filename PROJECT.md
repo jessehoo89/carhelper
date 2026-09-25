@@ -213,6 +213,48 @@ LIGHTBOX 有两条路（`s1/t.java:84-117`），**按 `cmd` 是否支持二选�
 教训：**装机优先用平台自家工具（`adb install`）走的那条路**——带 `-S` 的流式安装，不解析文件、不占临时空间；
 "先推文件再 `pm install 文件路径"` 只能当兜底，别当主干。
 
+
+## v1.0.4 + 车机端 v1.0.1（2026-09-25 深夜）：「万物全屏」为什么必须用悬浮窗
+
+### 现象与根因
+
+车机端老版本（点自己 App 里的按钮）实测：**只把当前窗口铺满，切到别的 App 全屏就没了**。
+根因在 `geely_multi.moveScreen2Screen(from, to, false)` 的语义：
+> 它搬的是**该区域此刻正在显示的那个页面/窗口**。
+
+老版本是「打开我们自己的全屏工具 → 点按钮」，那一刻 1001 区的顶层应用**就是我们自己**，于是系统搬走的只是我们自己的窗口；换 App 后顶层窗口变了，全屏状态自然消失。**跟参数、跟服务都无关，是「什么时候发起调用」的问题。**
+
+### LIGHTBOX / ONE BOX 的做法（对照结论）
+
+| 环节 | 实现 | 出处 |
+|---|---|---|
+| 触发入口 | **悬浮球（TYPE_APPLICATION_OVERLAY=2038）+ 前台服务**——浮层不是 Activity，不抢「顶层应用」，用户可在任意 App 前台时点它 | MAX `FsFloatService.java:416/432` |
+| 搬屏调用 | `moveScreen2Screen(from, to, false)`（transact 6，第三参写 0） | MAX `C2.java:51-60`、ONE BOX `GeelyFs.java:44-52` |
+| 搬前等稳定 | 轮询 `topPkg(from)` 最多 2.6s、120ms 一次，直到等于预期包名 | MAX `RunnableC0139c2.java:29-41` |
+| 搬后复核 | 等 800ms 看 `topPkg(to)` 是否为目标包；不符则提示「该应用不支持屏幕搬移」（ONE BOX 版还会回滚） | `RunnableC0139c2.java:52-58`、ONE BOX `MainActivity.java:1541-1546` |
+| 状态与退出 | 前台服务 + 常驻通知「全屏中 · 应用名」+「退出全屏」→ `moveScreen(1003, 原区)` | MAX/ONE BOX `FsService.java` |
+| 可搬判据 | 排除自己 / launcher / systemui / packageinstaller / permissioncontroller | MAX `C2.java:35` |
+| 装后配置 | `appops set --user N <pkg> SYSTEM_ALERT_WINDOW allow` + `am start-foreground-service …` | findings/02 第 7 步 |
+
+### 本项目改动
+
+**车机端（com.carhelper.fullscreen v1.0.1，20,907 字节）**
+- 新增 `Geely.java`：geely_multi 调用桥（moveScreen 第三参固定 0、topPkg、isTransferable 排除表）。
+- 新增 `FullscreenService.java`：悬浮球（可拖动、点击=全屏/还原）+ 前台服务 + 常驻通知，内含「等稳定 → 搬屏 → 800ms 复核 → 不符回滚」完整流程；服务被回收时自动还原，避免屏幕卡在全屏。
+- `MainActivity` 改为控制台：状态（服务/权限/全屏状态/三区顶层应用）+ ①授予悬浮窗 ②启动悬浮球 + 还原 / 停止。
+- Manifest 加 `SYSTEM_ALERT_WINDOW`、`FOREGROUND_SERVICE`，服务 `exported=true`（便于 adb 直接拉起）。
+
+**手机端（com.carhelper.phone v1.0.4，57,872 字节）**
+- 装完全屏工具后自动做装后配置：appops 授悬浮窗 + am start-foreground-service 拉起悬浮球，并 appops get 复核、结果打进日志。
+- 卡片②新增「授予悬浮窗权限 + 启动悬浮球」按钮（不重装也能补配置）。
+
+### 待实机验证
+
+1. 用手机端重装全屏工具（会自动授权+启动悬浮球）或点新按钮；
+2. 车机上切到任意 App（如网易爆米花）→ 点悬浮球 → 应铺满全屏，**且切到别的 App 后仍是全屏**（搬的是「区域」而不是窗口）；
+3. 再点悬浮球（或通知里的「退出全屏」）还原；
+4. 若搬屏后换 App 仍掉全屏 → 说明本车机 `moveScreen2Screen` 是「一次性窗口搬移」语义，那就给悬浮球加「监听顶层应用变化自动重放」的守护（LIGHTBOX 里没有这一步，故先不加，避免多余系统调用）。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）
@@ -221,6 +263,7 @@ LIGHTBOX 有两条路（`s1/t.java:84-117`），**按 `cmd` 是否支持二选�
 - [ ] 可选：照 LIGHTBOX 补 `cmd` 能力探测（先探测再选路，省一次失败尝试）
 - [ ] 可选：装后校验 `pm path --user N <pkg>` + `appops set … SYSTEM_ALERT_WINDOW allow`
 - [ ] 可选：shell 命令改用 `shell,v2,raw:`（二进制/退出码更干净）
+- [ ] 实机验证万物全屏（悬浮球）切换 App 后是否保持；若掉则加自动重放守护
 - [ ] 大包推送性能：`WRTE` 流控改为窗口化
 - [ ] 后排空间命名按实机校准（不同固件的空间编号可能不同）
 - [ ] 装机后校验：`pm path --user N <pkg>` 确认落点

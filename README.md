@@ -128,8 +128,21 @@ cd ../..
 车机端通过系统服务 `geely_multi` 的隐藏 AIDL 接口 `android.view.IGeelyMultiManagerExt` 调整显示区域：
 
 - 区域常量：`1001` 中控 / `1002` 副驾 / `1003` 全屏
-- 全屏 = `moveScreen2Screen(区, 1003)`；还原 = `moveScreen2Screen(1003, 区)`
-- 以 `Binder.transact` 直调，必要时回退到反射 AIDL 接口
+- 全屏 = `moveScreen2Screen(区, 1003, false)`（`transact(6)`，第三参固定 `0`）；还原 = `moveScreen2Screen(1003, 原区, false)`
+- 查询顶层应用 = `getTopPkgName(区)`（`transact(4)`）；以 `Binder.transact` 直调，必要时回退反射 AIDL 接口
+
+**⚠️ 它搬的是「该区域当前显示的那个页面」，所以触发时机决定成败：**
+
+- 在本工具自己的 Activity 前台时调用 → 只会搬走本工具自己的窗口，用户一换 App 全屏就消失；
+- 正确做法是**悬浮球**：`TYPE_APPLICATION_OVERLAY`(=2038) 浮层不是 Activity，不抢「顶层应用」，
+  用户可在任意 App 前台时点它，搬走的才是那个 App（LIGHTBOX / ONE BOX 即此做法）；
+- 完整流程：点球 → 读 `getTopPkgName(1001/1002)` 选目标区（排除自己/launcher/systemui）→
+  **轮询等页面稳定（≤2.6s，120ms）** → 搬屏 → **800ms 后复核 `getTopPkgName(1003)`**，
+  不符则回滚并提示「该应用不支持全屏（系统限制）」→ 常驻通知「全屏中 · 应用」+「退出全屏」。
+
+悬浮球需要 `SYSTEM_ALERT_WINDOW`：手机端装完全屏工具会自动执行
+`appops set --user N com.carhelper.fullscreen SYSTEM_ALERT_WINDOW allow` 并
+`am start-foreground-service …/FullscreenService`；也可在车机端打开「车机助手·万物全屏」点①②手动授权。
 
 ## ⚠️ 免责声明
 

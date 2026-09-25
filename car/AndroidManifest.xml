@@ -1,24 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.carhelper.fullscreen"
-    android:versionCode="1"
-    android:versionName="1.0.0">
+    android:versionCode="2"
+    android:versionName="1.0.1">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="30" />
 
+    <!-- 悬浮球：非 Activity 图层，才能在"别的 App 前台"时发起搬屏 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
     <application
-        android:label="车机助手·一键全屏"
-        android:allowBackup="false"
-        android:supportsRtl="false">
+        android:label="车机助手·万物全屏"
+        android:allowBackup="false">
         <activity
             android:name="com.carhelper.fullscreen.MainActivity"
             android:exported="true"
-            android:launchMode="singleTask"
-            android:excludeFromRecents="false">
+            android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 导出以便手机端装机工具用 adb 直接拉起：am start-foreground-service ... -->
+        <service
+            android:name="com.carhelper.fullscreen.FullscreenService"
+            android:exported="true" />
     </application>
 </manifest>

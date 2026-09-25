@@ -226,6 +226,20 @@ public class MainActivity extends Activity {
         c2.addView(btn("一键安装「全屏工具」到车机", "#238636", new Runnable() {
             public void run() { installBuiltin(); }
         }));
+        c2.addView(gap(8));
+        c2.addView(btn("授予悬浮窗权限 + 启动悬浮球", "#30363D", new Runnable() {
+            public void run() {
+                if (!ensureConnected()) return;
+                final int uid = chosenUser >= 0 ? chosenUser : 0;
+                setStatus("正在配置万物全屏（" + spaceLabel(uid) + "）…");
+                new Thread(new Runnable() {
+                    public void run() {
+                        postConfigFullscreen(uid);
+                        setStatus("万物全屏已配置（" + spaceLabel(uid) + "）");
+                    }
+                }).start();
+            }
+        }));
 
         // ---------------- 卡片 ③ 授权空间管理 ----------------
         LinearLayout c3 = card(root, "③ 应用授权空间管理", "给已装应用批量授权 / 取消授权到指定空间");
@@ -847,8 +861,7 @@ public class MainActivity extends Activity {
 
     private void done(String label, int uid, boolean launch, String out, long t0) throws IOException {
         if (launch) {
-            adb.shell("am start --user " + uid
-                    + " -n com.carhelper.fullscreen/com.carhelper.fullscreen.MainActivity");
+            postConfigFullscreen(uid);
         }
         setStatus(label + " 安装成功（" + spaceLabel(uid) + "）");
         log("✅ 安装成功：" + spaceRowTitle(uid)
@@ -860,6 +873,32 @@ public class MainActivity extends Activity {
      * 走 streamToService 而不是 shell()：服务流结尾设备可能不发 CLSE，
      * 这里靠输出里的 Success / Failure 判定结束，天然不依赖 CLSE。
      */
+    /**
+     * 「万物全屏」装后配置（照 LIGHTBOX：装完就给 appops 悬浮窗权限并拉起它的前台服务）。
+     * 必须给 SYSTEM_ALERT_WINDOW：全屏靠悬浮球（非 Activity 图层）在"别的 App 前台"时发起搬屏，
+     * 否则在自家窗口里点按钮只会把自家窗口搬走。
+     */
+    private void postConfigFullscreen(int uid) {
+        final String pkg = "com.carhelper.fullscreen";
+        try {
+            String r1 = adb.shell("appops set --user " + uid + " " + pkg
+                    + " SYSTEM_ALERT_WINDOW allow 2>&1", 30000).trim();
+            String r2 = adb.shell("am start-foreground-service --user " + uid + " -n "
+                    + pkg + "/" + pkg + ".FullscreenService 2>&1", 30000).trim();
+            String r3 = adb.shell("appops get --user " + uid + " " + pkg
+                    + " SYSTEM_ALERT_WINDOW 2>&1", 30000).trim();
+            log("装后配置（万物全屏）：\n"
+                    + "· 授权悬浮窗 → " + nz(r1) + "\n"
+                    + "· 启动悬浮球服务 → " + nz(r2) + "\n"
+                    + "· appops 复核 → " + nz(r3) + "\n"
+                    + "用法：车机上回到桌面或切到任意 App，点屏幕边缘的圆形悬浮球即可全屏当前页面，再点一次还原；"
+                    + "通知栏里也有「退出全屏」。");
+        } catch (Exception e) {
+            log("装后配置异常：" + e.getMessage()
+                    + "\n可手动在车机端打开「车机助手·万物全屏」，点①授予悬浮窗、②启动悬浮球。");
+        }
+    }
+
     private String pmInstall(int uid, String path) throws IOException {
         String out = runOnDevice("shell:pm install -r --user " + uid + " " + path, 300000);
         if (out.contains("INSTALL_FAILED_TEST_ONLY")) {
