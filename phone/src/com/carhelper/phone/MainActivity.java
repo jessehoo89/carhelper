@@ -103,6 +103,8 @@ public class MainActivity extends Activity {
     private final List<Integer> deviceUsers = new ArrayList<Integer>();
     private final List<String> deviceUserNames = new ArrayList<String>();
     private final List<String> allPkgs = new ArrayList<String>();
+    /** 全部包（含系统/预置），仅用于关键字搜索 */
+    private final List<String> allPkgsAny = new ArrayList<String>();
     /** 包名 → 它装在哪些用户空间（列表里显示，卸载时用来清残留） */
     private final java.util.Map<String, List<Integer>> pkgUsers = new java.util.LinkedHashMap<String, List<Integer>>();
     private final List<Integer> pickedSpaces = new ArrayList<Integer>();
@@ -1179,9 +1181,19 @@ public class MainActivity extends Activity {
                     //     `pm list packages -3` 只看 shell 自己的 user（默认 0），
                     //     而我们的应用装在 12（活跃空间）→ 直接查会得到 0 个（v1.0.6 的 bug）。
                     allPkgs.clear();
+                    allPkgsAny.clear();
                     pkgUsers.clear();
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         int uid = deviceUsers.get(i).intValue();
+                        // 全部包（含系统/预置）——用于关键字搜索，方便找"预置同名包"这类装不上的元凶
+                        String anyOut = adb.shell("pm list packages --user " + uid + " 2>/dev/null");
+                        for (String line : anyOut.split("\n")) {
+                            String t = line.trim();
+                            if (t.startsWith("package:")) {
+                                String pk = t.substring(8).trim();
+                                if (!allPkgsAny.contains(pk)) allPkgsAny.add(pk);
+                            }
+                        }
                         String out = adb.shell("pm list packages -3 --user " + uid + " 2>/dev/null");
                         for (String line : out.split("\n")) {
                             String t = line.trim();
@@ -1197,6 +1209,7 @@ public class MainActivity extends Activity {
                         }
                     }
                     Collections.sort(allPkgs);
+                    Collections.sort(allPkgsAny);
 
                     // 3) 屏幕归属旁证（display ↔ user，仅打到日志里，用于核对/校正标签）
                     String evidence = "";
@@ -1272,12 +1285,15 @@ public class MainActivity extends Activity {
         appBox.removeAllViews();
         String f = filter.toLowerCase();
         int shown = 0;
-        for (final String p : allPkgs) {
+        // 没输关键字 → 只列第三方；输了关键字 → 连系统/预置一起搜（"预置同名包"是装不上的常见元凶）
+        List<String> src = f.length() > 0 ? allPkgsAny : allPkgs;
+        for (final String p : src) {
             if (f.length() > 0 && !p.toLowerCase().contains(f)) continue;
             if (shown++ >= 120) break;
             List<Integer> us = pkgUsers.get(p);
             TextView tv = new TextView(this);
-            tv.setText(p + (us == null || us.isEmpty() ? "" : "   [空间 " + joinInts(us) + "]"));
+            tv.setText(p + (allPkgs.contains(p) ? "" : "   [预置/系统]")
+                    + (us == null || us.isEmpty() ? "" : "   [空间 " + joinInts(us) + "]"));
             tv.setTextSize(13);
             tv.setPadding(dp(12), dp(10), dp(12), dp(10));
             boolean sel = p.equals(selectedPkg);
