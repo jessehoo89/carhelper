@@ -11,4 +11,5 @@ build/keystore/
 # 联测产物
 tests/out/
 tests/keys.txt
+tests/*_keys.txt
 tests/*.log
