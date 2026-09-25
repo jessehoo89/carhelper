@@ -382,7 +382,7 @@ public class MainActivity extends Activity {
             public void run() { installBuiltin(); }
         }));
         c2.addView(gap(8));
-        c2.addView(btn("授予悬浮窗权限 + 启动悬浮球", "#30363D", new Runnable() {
+        c2.addView(btn("授权（悬浮窗 + 安装未知应用）+ 启动悬浮球", "#30363D", new Runnable() {
             public void run() {
                 if (!ensureConnected()) return;
                 final int uid = chosenUser >= 0 ? chosenUser : 0;
@@ -1294,12 +1294,16 @@ public class MainActivity extends Activity {
         try {
             String r1 = sh("appops set --user " + uid + " " + pkg
                     + " SYSTEM_ALERT_WINDOW allow 2>&1", 30000).trim();
+            // 车机端"手机上传安装"走 PackageInstaller 会话 → 需要允许"安装未知应用"
+            String r1b = sh("appops set --user " + uid + " " + pkg
+                    + " REQUEST_INSTALL_PACKAGES allow 2>&1", 30000).trim();
             String r2 = sh("am start-foreground-service --user " + uid + " -n "
                     + pkg + "/" + pkg + ".FullscreenService 2>&1", 30000).trim();
             String r3 = sh("appops get --user " + uid + " " + pkg
                     + " SYSTEM_ALERT_WINDOW 2>&1", 30000).trim();
             log("装后配置（万物全屏）：\n"
                     + "· 授权悬浮窗 → " + nz(r1) + "\n"
+                    + "· 授权安装未知应用 → " + nz(r1b) + "\n"
                     + "· 启动悬浮球服务 → " + nz(r2) + "\n"
                     + "· appops 复核 → " + nz(r3) + "\n"
                     + "用法：车机上回到桌面或切到任意 App，点屏幕边缘的圆形悬浮球即可全屏当前页面，再点一次还原；"

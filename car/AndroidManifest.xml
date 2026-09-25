@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.carhelper.fullscreen"
-    android:versionCode="2"
-    android:versionName="1.0.1">
+    android:versionCode="3"
+    android:versionName="1.0.2">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="30" />
 
     <!-- 悬浮球：非 Activity 图层，才能在"别的 App 前台"时发起搬屏 -->
+    <!-- 手机上传安装：本地 HTTP 服务 + PackageInstaller 会话 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 

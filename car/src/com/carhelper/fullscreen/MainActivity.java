@@ -28,6 +28,10 @@ public class MainActivity extends Activity {
 
     private TextView status;
     private TextView log;
+    private TextView upUrl;
+    private TextView upStatus;
+    private UploadServer uploadServer;
+    private String uploadToken = "";
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     @Override
@@ -144,6 +148,63 @@ public class MainActivity extends Activity {
             }
         }));
 
+        // ---------------- 手机上传安装（实验） ----------------
+        root.addView(gap(16));
+        LinearLayout upCard = new LinearLayout(this);
+        upCard.setOrientation(LinearLayout.VERTICAL);
+        upCard.setBackground(rounded("#161C22", 12));
+        int upPad = dp(14);
+        upCard.setPadding(upPad, upPad, upPad, upPad);
+        TextView upTitle = new TextView(this);
+        upTitle.setText("手机上传安装（实验）");
+        upTitle.setTextColor(Color.WHITE);
+        upTitle.setTextSize(18);
+        upCard.addView(upTitle);
+        TextView upDesc = new TextView(this);
+        upDesc.setText("手机连同一热点 → 浏览器打开下面网址 → 选 APK 上传 → 车机走\n**系统安装流程**（第三方应用会在车机屏弹确认框）。\n"
+                + "这条路不做任何绕过：车机自带的包名校验/白名单照样生效，正好用来实测它拦什么、放什么。");
+        upDesc.setTextColor(Color.parseColor("#8B949E"));
+        upDesc.setTextSize(12);
+        upDesc.setPadding(0, dp(6), 0, dp(8));
+        upCard.addView(upDesc);
+        upUrl = new TextView(this);
+        upUrl.setText("（点「启动上传服务」生成网址）");
+        upUrl.setTextColor(Color.parseColor("#9FE870"));
+        upUrl.setTextSize(16);
+        upUrl.setTextIsSelectable(true);
+        upUrl.setPadding(dp(10), dp(10), dp(10), dp(10));
+        upUrl.setBackground(rounded("#0F1418", 8));
+        upCard.addView(upUrl);
+        upStatus = new TextView(this);
+        upStatus.setTextColor(Color.parseColor("#8B949E"));
+        upStatus.setTextSize(12);
+        upStatus.setPadding(0, dp(8), 0, 0);
+        upStatus.setText("未启动。");
+        upCard.addView(upStatus);
+        upCard.addView(gap(10));
+        upCard.addView(btn("启动上传服务", "在车机上开一个本地 HTTP 服务，供手机浏览器上传", "#1F6FEB", new Runnable() {
+            public void run() {
+                startUpload();
+            }
+        }));
+        upCard.addView(gap(8));
+        upCard.addView(btn("停止上传服务", null, "#30363D", new Runnable() {
+            public void run() {
+                stopUpload();
+            }
+        }));
+        upCard.addView(gap(8));
+        upCard.addView(btn("刷新本机地址", null, "#30363D", new Runnable() {
+            public void run() {
+                if (uploadServer != null && uploadServer.isRunning()) {
+                    upUrl.setText(uploadUrlText());
+                } else {
+                    upUrl.setText("（未启动）本机地址：" + localIp());
+                }
+            }
+        }));
+        root.addView(upCard);
+
         root.addView(gap(16));
         TextView adv = new TextView(this);
         adv.setText("说明：点「悬浮球」时若当前屏的顶层应用是桌面/系统界面，会提示先打开一个 App；"
@@ -197,6 +258,120 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ 状态
+
+    // ---------------------------------------------------------------- 手机上传安装
+
+    private String localIp() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> es = java.net.NetworkInterface.getNetworkInterfaces();
+            String best = null;
+            while (es != null && es.hasMoreElements()) {
+                java.net.NetworkInterface ni = es.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (java.net.InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    java.net.InetAddress a = ia.getAddress();
+                    if (a instanceof java.net.Inet4Address) {
+                        String ip = a.getHostAddress();
+                        if (ip.startsWith("172.") || ip.startsWith("192.168.")) return ip;
+                        if (best == null && !ip.startsWith("127.")) best = ip;
+                    }
+                }
+            }
+            return best == null ? "127.0.0.1" : best;
+        } catch (Throwable t) {
+            return "127.0.0.1";
+        }
+    }
+
+    private String uploadUrlText() {
+        return "http://" + localIp() + ":" + (uploadServer == null ? 8766 : uploadServer.port())
+                + "/?token=" + uploadToken;
+    }
+
+    private void startUpload() {
+        if (uploadServer != null && uploadServer.isRunning()) {
+            say("上传服务已在运行：\n" + uploadUrlText());
+            return;
+        }
+        uploadToken = randomToken();
+        for (int port : new int[]{8766, 8767, 8768, 8769}) {
+            try {
+                uploadServer = new UploadServer(port, uploadToken, "车机助手 · 上传安装", new UploadServer.Handler() {
+                    public String onUpload(java.io.InputStream body, long len, String name, boolean install) throws Exception {
+                        return handleUpload(body, len, name, install);
+                    }
+                });
+                uploadServer.start();
+                upUrl.setText(uploadUrlText());
+                upStatus.setText("已启动，端口 " + port + "。手机连车机热点后用浏览器打开上面的网址。");
+                say("上传服务已启动：" + uploadUrlText());
+                return;
+            } catch (Throwable t) {
+                U.log("端口 " + port + " 启动失败: " + t);
+            }
+        }
+        upStatus.setText("启动失败：8766~8769 都被占用");
+        say("上传服务启动失败：端口被占用");
+    }
+
+    private void stopUpload() {
+        if (uploadServer != null) {
+            uploadServer.stop();
+        }
+        upStatus.setText("已停止。");
+        say("上传服务已停止");
+    }
+
+    private static String randomToken() {
+        String chars = "abcdefghjkmnpqrstuvwxyz23456789";
+        StringBuilder sb = new StringBuilder();
+        java.util.Random r = new java.util.Random();
+        for (int i = 0; i < 4; i++) sb.append(chars.charAt(r.nextInt(chars.length())));
+        return sb.toString();
+    }
+
+    /** 收到手机上传：落盘 → 可选走 PackageInstaller 安装。 */
+    private String handleUpload(java.io.InputStream body, long len, String name, boolean install) throws Exception {
+        java.io.File dir = new java.io.File(getCacheDir(), "uploads");
+        dir.mkdirs();
+        String safe = name.replaceAll("[^A-Za-z0-9._-]", "_");
+        final java.io.File f = new java.io.File(dir, System.currentTimeMillis() + "-" + safe);
+        java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
+        long total = 0;
+        try {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = body.read(buf)) > 0) {
+                fos.write(buf, 0, n);
+                total += n;
+                if (len > 0 && total >= len) break;
+            }
+        } finally {
+            try {
+                fos.close();
+            } catch (Exception ignored) {
+            }
+        }
+        U.log("收到上传 " + name + " " + total + " 字节 → " + f);
+        if (total <= 0) {
+            upStatus.setText("收到空文件");
+            return "没收到数据（0 字节）";
+        }
+        final String head = name + "（" + (total / 1048576) + " MB）";
+        ui.post(new Runnable() {
+            public void run() {
+                upStatus.setText("已收到 " + head + "，正在提交安装…");
+            }
+        });
+        if (!install) {
+            String msg = "已保存到车机：" + f.getAbsolutePath() + "\n大小 " + total + " 字节（未安装）";
+            upStatus.setText("已保存 " + head);
+            return msg;
+        }
+        String r = ApkInstaller.install(this, f);
+        upStatus.setText(head + " → " + r);
+        return r + "\n文件：" + f.getAbsolutePath() + "（" + total + " 字节）";
+    }
 
     private void refresh() {
         new Thread(new Runnable() {

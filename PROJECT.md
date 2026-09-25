@@ -463,6 +463,22 @@ v1.0.12 的 `reconnect()` 第一句就是 `if (adb.isConnected()) return true;` 
 - `setStatus()` 同时刷新主页与两个功能页的状态区（在哪个页面都看得到最新进展）；`refresh()` 只更新主页状态，**不会覆盖功能页的执行状态**；
 - 删除 `checkAuthKeys()` 及其按钮（含 `adb_keys` 比对逻辑）。
 
+
+## 车机端 v1.0.2 / 手机端 v1.1.1（2026-09-26）：移植 LIGHTBOX MAX 的「手机上传安装」
+
+目的：实机验证"不用 ADB，直接在车机上把 APK 送进系统安装流程"到底能装什么。
+
+**实现（仿 MAX 的 `com/test/desktop/{P,Q,S}.java` + `com/test/lightbox/InstallerActivity`）**：
+- `UploadServer.java`：车机端手写 HTTP 服务（ServerSocket + 每连接一线程 + URL 一次性 token + 裸 body 上传 + 内嵌上传页，进度走 XHR）；端口 8766，被占用则顺延；
+- `ApkInstaller.java`：`PackageInstaller.createSession(MODE_FULL_INSTALL)` → `openWrite` 写入 → `fsync` → `commit(广播 PendingIntent)`；
+  收到 `STATUS_PENDING_USER_ACTION` 时把系统给的 EXTRA_INTENT 拉起（= 车机屏上的安装确认界面）；
+- 车机端界面新增「手机上传安装（实验）」卡片：显示网址、启动/停止、最近上传与安装结果；
+- 手机端 `postConfigFullscreen()` 追加 `appops set … REQUEST_INSTALL_PACKAGES allow`；
+- manifest 增 `INTERNET` + `REQUEST_INSTALL_PACKAGES`。
+
+**明确不做绕过**：走的是系统安装侧，**车机自带的包名校验/白名单照样生效** —— 正好用它实测"拦什么、放什么"。
+另有「只保存到车机」模式（纯文件传输，不经任何校验）。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）
