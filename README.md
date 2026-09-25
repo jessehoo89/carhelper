@@ -95,6 +95,9 @@ cd ../..
 - 握手 `CNXN`；认证 `AUTH`（`TOKEN` → `SIGNATURE`，必要时发 `RSAPUBLICKEY` 触发车机屏授权）
 - 流操作：`OPEN` / `WRTE` / `OKAY` / `CLSE`，支持 `shell:` 执行命令与 `sync:` 推送文件
 - **密钥持久化**：RSA 密钥由 `KeyProvider` 落盘（手机端存 SharedPreferences）。密钥一变，车机就会重新弹授权框，所以**必须**持久化——一次授权长期免弹。
+- **公钥 blob 必须用 AOSP `android_pubkey` 的 524 字节小端格式**（`4+4+256+256+4`）：首字段是**模数的 32 位字数 64**，随后 `n0inv`、256 字节小端模数、256 字节小端 `rr = R² mod n`（R=2²⁰⁴⁸）、`e`。
+  ⚠️ 写成"字节数 len + nlen + 大端模数 + 4 字节 rr"（276 字节）时，车机照样弹授权框，但**存下来的公钥永远验不过签名 → 每次连接都重新弹框**。别照记忆里的旧 mincrypt 结构写。
+- **签名算法**：`SHA1withRSA`（PKCS#1 v1.5 over SHA-1 of the token）。依据 adbd `daemon/auth.cpp` 用 `RSA_verify(NID_sha1, token, token_size, sig, …)` 验签。
 - **推送用 `SEND_V1` 协议，载荷格式为 `<路径>,<八进制权限>`**（例 `/data/local/tmp/a.apk,0644`），不是"长度前缀路径 + 二进制 mode"。权限串**必须带前导 `0`**：adbd 用 `strtoul(s, NULL, 0)` 解析，`644` 会被当成十进制。格式写错时 adbd 会回 `FAIL missing , in ID_SEND_V1` 或直接断连接。
 - 单块上限取 adbd 通告的 `maxdata` 与 `SYNC_DATA_MAX`(64KB) 的较小值
 - 所有流的 `OKAY`/`CLSE` 都按 `arg1 == 本端 local id` 判归属——上一条流（如同步推送）滞后的报文不能被下一条流误认，否则 `shell()` 会静默返回空

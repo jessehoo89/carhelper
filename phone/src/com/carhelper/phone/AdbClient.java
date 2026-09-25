@@ -74,6 +74,8 @@ public class AdbClient {
     private static final int SYNC_DATA_MAX = 64 * 1024;  // adbd sync 服务的单块上限（勿超）
     private static final String BANNER = "carhelper";
     private static final String FEATURES = "host::features=shell_v2,cmd,stat_v2,ls_v2,apex";
+    /** AOSP android_pubkey 编码长度：4+4+256+256+4 */
+    private static final int ANDROID_PUBKEY_ENCODED_SIZE = 524;
 
     /** 打开后把收发报文打到 stdout（桌面联测/排障用），线上保持 false。 */
     public static boolean DEBUG = false;
@@ -209,37 +211,55 @@ public class AdbClient {
         }
     }
 
-    /** ADB 私有公钥格式：base64(结构体) + " " + user@host + "\0"。 */
+    /**
+     * ADB 公钥 blob（android_pubkey 格式，**524 字节**，全程小端）。
+     *
+     *   offset   0 : uint32 modulus_size_words = 64      （注意是"32 位字数"，不是字节数！）
+     *   offset   4 : uint32 n0inv = -n⁻¹ mod 2³²
+     *   offset   8 : uint8[256] modulus                 （小端）
+     *   offset 264 : uint8[256] rr = R² mod n, R = 2²⁰⁴⁸（小端，完整 256 字节）
+     *   offset 520 : uint32 exponent
+     *   末尾拼 " <名字>\0" 后再 base64。
+     *
+     * 依据：AOSP `crypto_utils/android_pubkey.h`（ANDROID_PUBKEY_ENCODED_SIZE = 4+4+256+256+4 = 524）
+     *      与 Android `android_pubkey_encode()`。
+     * ⚠️ 曾经写错过一版（276 字节、多带一个 nlen 字段、模数用大端、rr 只取低 32 位）——
+     *    那种结构车机能弹授权框、却永远验不过签名，表现为**每次连接都重新弹授权**。别改回去。
+     */
     private byte[] adbPublicKeyBytes() throws IOException {
         try {
             RSAPublicKey rk = (RSAPublicKey) pub;
-            byte[] nRaw = rk.getModulus().toByteArray(); // 大端，可能带前导 0
-            int off = (nRaw.length > 1 && nRaw[0] == 0) ? 1 : 0;
-            int nlen = nRaw.length - off;
-            byte[] n = new byte[nlen];
-            System.arraycopy(nRaw, off, n, 0, nlen);
-            int e = rk.getPublicExponent().intValue();
+            BigInteger n = rk.getModulus();
+            BigInteger e = rk.getPublicExponent();
 
-            BigInteger N = new BigInteger(1, n);
             BigInteger M32 = BigInteger.ONE.shiftLeft(32);
-            BigInteger n0 = N.mod(M32);
-            int n0inv = n0.modInverse(M32).negate().mod(M32).intValue();
-            BigInteger R = BigInteger.ONE.shiftLeft(32 * nlen);
-            int rr = R.modPow(BigInteger.valueOf(2), N).intValue();
+            int n0inv = n.mod(M32).modInverse(M32).negate().mod(M32).intValue();
+            BigInteger R = BigInteger.ONE.shiftLeft(32 * 64);            // 2^2048
+            BigInteger rr = R.modPow(BigInteger.valueOf(2), n);          // 2^4096 mod n
 
-            int total = 4 + 4 + 4 + nlen + 4 + 4;
-            ByteBuffer bb = ByteBuffer.allocate(total).order(ByteOrder.LITTLE_ENDIAN);
-            bb.putInt(total);
+            ByteBuffer bb = ByteBuffer.allocate(ANDROID_PUBKEY_ENCODED_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+            bb.putInt(64);                       // modulus_size_words
             bb.putInt(n0inv);
-            bb.putInt(nlen);
-            bb.put(n);        // modulus（大端）
-            bb.putInt(rr);
-            bb.putInt(e);     // exponent（小端）
+            bb.put(toLE(n, 256));
+            bb.put(toLE(rr, 256));
+            bb.putInt(e.intValue());
             String s = Base64.encodeToString(bb.array(), Base64.NO_WRAP) + " " + BANNER + "\0";
             return s.getBytes("UTF-8");
         } catch (Exception ex) {
             throw new IOException("公钥编码失败: " + ex);
         }
+    }
+
+    /** android_pubkey 用大端数值的小端字节序：BigInteger → 定长小端字节数组。 */
+    private static byte[] toLE(BigInteger v, int size) {
+        byte[] be = v.toByteArray();
+        int off = (be.length > 1 && be[0] == 0) ? 1 : 0;
+        int len = Math.min(be.length - off, size);
+        byte[] out = new byte[size];
+        for (int i = 0; i < len; i++) {
+            out[i] = be[be.length - 1 - i];       // 反转成小端，尾部补 0
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------ shell

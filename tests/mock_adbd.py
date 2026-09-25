@@ -102,17 +102,21 @@ def rsa_verify_sha1(pub, sig, data):
 
 
 def parse_adb_pubkey(blob):
+    """严格校验 android_pubkey 524 字节小端格式（AOSP crypto_utils/android_pubkey.c）。"""
     txt = blob.split(b'\0')[0].decode()
     b64 = txt.split(' ')[0]
     raw = base64.b64decode(b64)
-    ln, n0inv, nlen = struct.unpack('<3i', raw[:12])
-    if ln != len(raw):
-        raise ValueError('pubkey len mismatch %d != %d' % (ln, len(raw)))
-    n = int.from_bytes(raw[12:12 + nlen], 'big')
-    rr, e = struct.unpack('<2i', raw[12 + nlen:12 + nlen + 8])
-    assert (-pow(n, -1, 1 << 32)) % (1 << 32) == n0inv % (1 << 32), 'n0inv 编码错误'
-    rr_full = pow(2, 2 * 32 * nlen, n)  # rr 在结构里是 uint32，只比低 32 位
-    assert (rr_full & 0xffffffff) == (rr & 0xffffffff), 'rr 编码错误'
+    assert len(raw) == 524, '公钥 blob 长度必须是 524，实际 %d' % len(raw)
+    words, n0inv = struct.unpack('<2I', raw[:8])
+    assert words == 64, 'modulus_size_words 必须是 64，实际 %d' % words
+    n = int.from_bytes(raw[8:264], 'little')
+    rr = int.from_bytes(raw[264:520], 'little')
+    (e,) = struct.unpack('<I', raw[520:524])
+    assert n.bit_length() > 2000, '模数不是小端 2048 位（bit_length=%d）' % n.bit_length()
+    assert (-pow(n, -1, 1 << 32)) % (1 << 32) == n0inv, 'n0inv 错误'
+    assert pow(2, 4096, n) == rr, 'rr 必须是完整的 2^4096 mod n（旧版只截断了低 32 位 → 车机永远验签失败）'
+    log('公钥格式校验通过：524 字节小端 / words=64 / n0inv+rr 正确 / e=%d / banner=%s'
+        % (e, txt.split(' ')[1] if ' ' in txt else '?'))
     return (n, e), b64
 
 

@@ -255,6 +255,51 @@ LIGHTBOX 有两条路（`s1/t.java:84-117`），**按 `cmd` 是否支持二选�
 3. 再点悬浮球（或通知里的「退出全屏」）还原；
 4. 若搬屏后换 App 仍掉全屏 → 说明本车机 `moveScreen2Screen` 是「一次性窗口搬移」语义，那就给悬浮球加「监听顶层应用变化自动重放」的守护（LIGHTBOX 里没有这一步，故先不加，避免多余系统调用）。
 
+
+## v1.0.6（2026-09-25 晚）：**ADB 公钥格式写错了 —— 这才是"每次连接都重弹授权框"的真因**
+
+用户回执：改造版 App（箭头音乐）装不上 + **每次点「一键连接车机」都要重新认证指纹**。
+逐条查证：
+
+### ① 装不上 = 车机还留着官方同名应用（**不是我们的包有问题**）
+实机日志（v1.0.4/1.0.5）：
+```
+[A] 流式安装：exec:cmd package install -S 56792449 …（传输 10/20/30/40/50 MB 正常）
+[A] 未成功：Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.sumsg.musichub
+             signatures do not match previously installed version; ignoring!]
+[A2]/[A3] 同因；[B]/[C] 则是本车机"从 /data/local/tmp 读文件装"的老毛病（parseApkLite 失败，与文件无关）
+```
+⇒ A 方式**已经解析成功才报签名冲突**，说明包本身没问题；根因是 **`pm uninstall --user N` 只摘一个空间**，
+任一空间还留着旧包就会一直报签名冲突。
+
+**修法**：卡片③新增 **「彻底卸载（所有空间，清残留）」** —— 对每个空间 `pm uninstall --user N`，再 `pm uninstall <pkg>`（对所有用户）一次，
+然后逐空间 `pm path --user N` + `pm list packages -u` 复核残留，日志明确告诉用户"各空间均已移除"还是"仍残留"。
+安装失败时的提示也改为**优先报最有价值的原因**（把 A/A2/A3/B/C 五次尝试的输出汇总后再判断，避免被 B/C 的文件解析错误带偏）。
+
+### ② 每次重弹授权 = **ADB 公钥 blob 结构写错**（我记错了 mincrypt 布局）
+
+对照两份"在真机上有效"的实现在源码级定案：
+
+| | 真实格式（AOSP `crypto_utils/android_pubkey.h` + LIGHTBOX `AbstractC0275a.o`） | 我 v1.0.0~v1.0.5 的实现 |
+|---|---|---|
+| 总长 | **524 字节**（`ANDROID_PUBKEY_ENCODED_SIZE`=4+4+256+256+4） | 276 字节 |
+| 第 1 个字段 | `modulus_size_words = 64`（**32 位字数**） | `276`（字节数） |
+| 结构 | n0inv + 256B 模数(**小端**) + 256B rr(**小端**) + e | n0inv + **多一个 nlen** + 256B 模数(**大端**) + **4 字节 rr** + e |
+| `rr` | 完整 `2^4096 mod n`（R=2²⁰⁴⁸） | 只取了 `.intValue()` 低 32 位 |
+
+后果：车机能弹授权框（它只按 blob 算指纹），但**存下来的公钥是垃圾**，之后每次验签都失败 → 每次重弹。
+**签名算法本身是对的**：`daemon/auth.cpp:204` 用 `RSA_verify(NID_sha1, token, token_size, sig, …)`，
+即 PKCS#1 v1.5 over **SHA1(token)** = Java 的 `SHA1withRSA`（LIGHTBOX 用 `RSA/ECB/NoPadding` 手拼前缀，等价）。
+
+**修法**：`AdbClient.adbPublicKeyBytes()` 改为输出 524 字节小端 `android_pubkey`；
+`tests/mock_adbd.py` 的解析器同步改成**严格校验**（长度=524、words=64、模数小端、n0inv、`rr == 2^4096 mod n`），
+成为回归用例 —— 以后谁改回错误结构，联测立刻红。
+
+### ③ 顺带的可观测性改进
+- 卡片④新增 **「复制日志」（一键进剪贴板，长日志直接发人）+「清空日志」**；日志上限提到 12000 字符；
+- 装前自检车机 `/data` 可用空间并打印（大包要留"临时文件+安装副本+解压 so"的余量，空间不足是常见失败原因）；
+- 每个方式失败都把**车机原文**（首 300 + 末 900）打进日志。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）

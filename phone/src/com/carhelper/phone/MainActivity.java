@@ -287,9 +287,32 @@ public class MainActivity extends Activity {
         c3.addView(btn("从选中空间取消授权", "#DA3633", new Runnable() {
             public void run() { applySpaces(false); }
         }));
+        c3.addView(gap(8));
+        c3.addView(btn("彻底卸载（所有空间，清残留）", "#8B1E1E", new Runnable() {
+            public void run() { purgePackage(); }
+        }));
 
         // ---------------- 卡片 ④ 日志 ----------------
-        LinearLayout c4 = card(root, "④ 运行日志", null);
+        LinearLayout c4 = card(root, "④ 运行日志", "长日志请点「复制日志」，粘给我即可定位");
+        LinearLayout logBtns = new LinearLayout(this);
+        logBtns.setOrientation(LinearLayout.HORIZONTAL);
+        Button cp = btn("复制日志", "#30363D", new Runnable() {
+            public void run() { copyLog(); }
+        });
+        Button cl = btn("清空日志", "#30363D", new Runnable() {
+            public void run() { clearLog(); }
+        });
+        LinearLayout.LayoutParams hw = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        cp.setLayoutParams(hw);
+        LinearLayout.LayoutParams hw2 = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        hw2.leftMargin = dp(8);
+        cl.setLayoutParams(hw2);
+        logBtns.addView(cp);
+        logBtns.addView(cl);
+        c4.addView(logBtns);
+        c4.addView(gap(8));
         logView = new TextView(this);
         logView.setTextColor(Color.parseColor("#8B949E"));
         logView.setTextSize(12);
@@ -335,6 +358,14 @@ public class MainActivity extends Activity {
     }
 
     private Button btn(String text, String color, final Runnable action) {
+        Button b = mkBtn(text, color, action);
+        b.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        return b;
+    }
+
+    /** 与 btn() 相同，但不预设布局参数（供横向排布用）。 */
+    private Button mkBtn(String text, String color, final Runnable action) {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
@@ -348,6 +379,18 @@ public class MainActivity extends Activity {
             public void onClick(View v) { action.run(); }
         });
         return b;
+    }
+
+    /** 复制当前日志到剪贴板（方便把长日志发出来）。 */
+    private void copyLog() {
+        try {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("carhelper-log", logBuf.toString()));
+            log("日志已复制到剪贴板（共 " + logBuf.length() + " 字符），粘到聊天里发我即可。");
+        } catch (Throwable t) {
+            log("复制失败：" + t.getMessage());
+        }
     }
 
     private void setStatus(final String s) {
@@ -365,7 +408,7 @@ public class MainActivity extends Activity {
             public void run() {
                 if (logBuf.length() > 0) logBuf.append("\n");
                 logBuf.append("[+").append((System.currentTimeMillis() - logT0) / 1000).append("s] ").append(s);
-                if (logBuf.length() > 6000) logBuf.delete(0, logBuf.length() - 5000);
+                if (logBuf.length() > 12000) logBuf.delete(0, logBuf.length() - 10000);
                 logView.setText(logBuf.toString());
             }
         });
@@ -723,6 +766,7 @@ public class MainActivity extends Activity {
         };
 
         String out = null;
+        final StringBuilder allErr = new StringBuilder();
         java.io.File staged = null;
         try {
             // ---------- 方式 0：把精确字节数拿到手（流式安装必须知道 size；内置资产被 zip 压缩过，openFd 取不到长度）
@@ -742,6 +786,15 @@ public class MainActivity extends Activity {
             }
             knownSize = size;
 
+            // ---------- 装前自检：车机 /data 可用空间（大包要留出「临时文件 + 安装副本 + 解压 so」的余量）
+            long freeKb = dataFreeKb();
+            if (freeKb > 0) {
+                long needKb = knownSize / 1024 * 5 / 2;
+                log("[自检] 车机 /data 可用 " + (freeKb / 1024) + " MB；本次 APK " + (knownSize / 1048576)
+                        + " MB，建议留 " + (needKb / 1024) + " MB 以上"
+                        + (freeKb < needKb ? "  ⚠️ 空间可能不足（这是安装失败的常见原因）" : ""));
+            }
+
             // ---------- 方式 A：流式安装（与 `adb install` 同一条路：stdin 直喂 pm/cmd，不落临时文件）
             if (knownSize > 0) {
                 setStatus("正在流式安装 " + label + " …");
@@ -754,6 +807,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 log("[A] 未成功：" + tailOf(a));
+                allErr.append("[A] ").append(tailOf(a)).append("\n");
                 log("[A2] 改用 pm install -S 再试 …");
                 String a2 = adb.streamToService(
                         "exec:pm install -S " + knownSize + " -r --user " + uid,
@@ -763,6 +817,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 log("[A2] 未成功：" + tailOf(a2));
+                allErr.append("[A2] ").append(tailOf(a2)).append("\n");
                 log("[A3] 换 shell 通道再走一次流式安装 …");
                 String a3 = adb.streamToService(
                         "shell:cmd package install -S " + knownSize + " -r --user " + uid,
@@ -772,6 +827,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 log("[A3] 未成功：" + tailOf(a3));
+                allErr.append("[A3] ").append(tailOf(a3)).append("\n");
             } else {
                 log("[A] 跳过流式安装（文件大小仍未知）");
             }
@@ -789,6 +845,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 log("[B] pm install 未成功：" + tailOf(out));
+                allErr.append("[B] ").append(tailOf(out)).append("\n");
             } else {
                 log("[B] 车机侧大小对不上（推送可能被截断）→ 转方式 C");
             }
@@ -808,7 +865,10 @@ public class MainActivity extends Activity {
             }
 
             setStatus(label + " 安装失败");
-            log("❌ 三种方式都没装上。车机最后返回：\n" + tailOf(out) + "\n" + installHint(String.valueOf(out)));
+            String joined = allErr.length() > 0 ? allErr.toString() : String.valueOf(out);
+            log("❌ 三种方式都没装上。车机最后返回：\n" + tailOf(out)
+                    + "\n\n【各方式原因汇总】\n" + tailOf(joined)
+                    + "\n" + installHint(joined, uid));
         } catch (Exception e) {
             setStatus("安装异常");
             String m = String.valueOf(e.getMessage());
@@ -936,10 +996,46 @@ public class MainActivity extends Activity {
         return t.substring(0, 300) + "\n……（中间省略）……\n" + t.substring(t.length() - 900);
     }
 
+    /** 车机 /data 可用空间（KB），读不到返回 -1。 */
+    private long dataFreeKb() {
+        try {
+            String s = adb.shell("df -k /data 2>/dev/null | tail -n 1 | awk '{print $4}'").trim();
+            return Long.parseLong(s.replaceAll("[^0-9]", ""));
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** 从车机返回里抠出报错涉及的包名。 */
+    private static String pkgFromError(String out) {
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]*)+)").matcher(out);
+            while (m.find()) {
+                String p = m.group(1);
+                if (p.contains(".") && !p.startsWith("android.") && !p.startsWith("java.")
+                        && !p.startsWith("com.android.")) {
+                    return p;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
     /** 常见 pm install 报错 → 人话建议。 */
-    private static String installHint(String out) {
+    private static String installHint(String out, int uid) {
+        if (out.contains("signatures do not match") || out.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")) {
+            String pkg = pkgFromError(out);
+            return "建议：车机上还留着同名应用（官方版签名 ≠ 改造版签名）→ 必须**从所有空间**彻底卸载再装：\n"
+                    + "① 本 App 卡片③ →「加载空间与应用列表」→ 应用列表里点选 " + (pkg == null ? "（该包名）" : pkg)
+                    + "\n② 点新按钮「彻底卸载（所有空间，清残留）」——它会对每个空间 pm uninstall，再对所有用户卸一次，并逐空间复核残留\n"
+                    + "③ 复核显示「各空间均已移除」后，回卡片②重新安装。\n"
+                    + "（只摘一个空间是不够的：任一空间留着旧包，重装就会继续报签名冲突；HiSH 亦可：adb shell pm uninstall " + (pkg == null ? "<包名>" : pkg) + "）";
+        }
         if (out.contains("INSTALL_FAILED_ALREADY_EXISTS"))
-            return "建议：车机已存在同名包但签名不同 → 先「从选中空间取消授权」（卸载）再装。";
+        if (out.contains("INSTALL_FAILED_ALREADY_EXISTS"))
+            return "建议：车机已存在同名包 → 用卡片③「从选中空间取消授权」卸载后重装。";
         if (out.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE"))
             return "建议：签名冲突，需先卸载车机上的旧版再装。";
         if (out.contains("INSTALL_FAILED_VERSION_DOWNGRADE"))
@@ -1131,6 +1227,60 @@ public class MainActivity extends Activity {
             tv.setLayoutParams(lp);
             appBox.addView(tv);
         }
+    }
+
+    /**
+     * 彻底卸载：把选中的包从**所有用户空间**移除，并逐空间复核残留。
+     *
+     * 为什么需要它：`pm uninstall --user N` 只摘掉某一个空间；
+     * 只要**任何一个**空间还留着这个包，重装改造版就会报
+     * INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package xxx signatures do not match previously installed version。
+     * 第 1 步 `pm uninstall <pkg>`（不带 --user）才是"对所有用户卸载"。
+     */
+    private void purgePackage() {
+        if (!ensureConnected()) return;
+        if (selectedPkg == null) {
+            log("请先在下方应用列表里点选一个包（可先用关键字搜索）。");
+            return;
+        }
+        final String pkg = selectedPkg;
+        setStatus("正在彻底卸载 " + pkg + " …");
+        new Thread(new Runnable() {
+            public void run() {
+                StringBuilder sb = new StringBuilder("彻底卸载 " + pkg + "：\n");
+                try {
+                    // 1) 先按空间逐个摘（system app 也只能这样摘）
+                    for (int i = 0; i < deviceUsers.size(); i++) {
+                        int uid = deviceUsers.get(i).intValue();
+                        String r = adb.shell("pm uninstall --user " + uid + " " + pkg + " 2>&1", 60000).trim();
+                        sb.append("· user ").append(uid).append("：").append(nz(r)).append("\n");
+                    }
+                    // 2) 再"对所有用户"卸载一次，清掉残留记录
+                    String all = adb.shell("pm uninstall " + pkg + " 2>&1", 60000).trim();
+                    sb.append("· 所有用户：").append(nz(all)).append("\n");
+                    adb.shell("pm clear " + pkg + " 2>&1", 30000);
+
+                    // 3) 逐空间复核：还有哪个空间留着它
+                    StringBuilder left = new StringBuilder();
+                    for (int i = 0; i < deviceUsers.size(); i++) {
+                        int uid = deviceUsers.get(i).intValue();
+                        String p = adb.shell("pm path --user " + uid + " " + pkg + " 2>/dev/null", 30000);
+                        if (p.contains("package:")) {
+                            left.append(uid).append(" ");
+                        }
+                    }
+                    String listU = adb.shell("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
+                    sb.append("· 复核 pm path：").append(left.length() == 0 ? "各空间均已移除 ✅" : "仍存在于空间 " + left).append("\n");
+                    sb.append("· pm list packages -u：").append(listU.length() == 0 ? "无记录 ✅" : listU);
+                    setStatus(left.length() == 0 ? "已彻底卸载：" + pkg : "仍有残留：" + pkg);
+                    log(sb.toString() + (left.length() == 0
+                            ? "\n现在可以回卡片②重新安装改造版了。"
+                            : "\n若仍失败，请把这段日志发我。"));
+                } catch (Exception e) {
+                    log("卸载异常：" + e.getMessage());
+                }
+            }
+        }).start();
     }
 
     private void applySpaces(final boolean grant) {
