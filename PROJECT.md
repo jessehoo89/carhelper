@@ -157,10 +157,42 @@ static bool do_send_v1(int s, const std::string& spec, ...) {
 - 服务不发 CLSE 时，shell 推送 1.5s 内返回且内容一致；
 - 流式安装路径（`exec:cmd package install -S`）可用。
 
+
+## v1.0.3（2026-09-25 深夜）：v1.0.2 实机日志定案 —— 本车机不能用"文件"装，只能用"流"
+
+v1.0.2 实机日志给出了完整链条（这次信息量极大）：
+
+```
+[+11s] [B] 已推送 16811 字节 / 车机侧 16811 字节          ← 传输完全正确（字节数一致）
+[+11s] [B] pm install 未成功：…om fd 1005
+       at android.content.res.ApkAssets.nativeLoadFd(Native Method)
+       at android.content.res.ApkAssets.<init>(ApkAssets.java:306)
+       at android.content.pm.parsing.ApkLiteParseUtils.parseApkLiteInner(...)
+       at com.android.server.pm.PackageManagerShellCommand.setParamsSize(...)
+```
+
+1. **传输没问题**：16811 == 16811，说明 `shell:cat >` 通道字节完全透明（顺带证明这台车的 `shell:` 不是 PTY，否则 CR/LF 转换会改变字节数）。
+2. **车机侧 `pm install <文件路径>` 会炸**：不带 `-S` 时，`PackageManagerShellCommand.setParamsSize()` 要先 `parseApkLite` 解析那个文件来推断大小，本固件上这一步 `nativeLoadFd` 直接失败（与 APK 内容无关，字节数核对过）。
+   ⇒ **这正好解释了为什么 HiSH 的 `adb install`（`Performing Streamed Install`，带 `-S`，不解析文件）能成功**：带 `-S` 时 sizeBytes 已知，`setParamsSize` 不走解析那条路。
+3. **而 v1.0.2 把流式安装（方式 A）跳过了**：内置全屏工具 APK 被 zip 压缩存进 assets，`getAssets().openFd()` 取不到长度 → `knownSize = -1` → `[A] 跳过流式安装（未知文件大小）` → 只能落到注定失败的文件方式。
+
+### 修法（v1.0.3）
+
+- **方式 0：拿准字节数**。size 未知时先把数据缓存到手机本地（`getCacheDir()`）量准长度，再做流式安装 —— 内置资产、任何来源的 URI 都适用，A 方式从此永远可用。
+- 流式安装三种通道依次尝试：**A1** `exec:cmd package install -S <size> -r --user N` → **A2** `exec:pm install -S …` → **A3** `shell:cmd package install -S …`（`shell:` 已证明字节透明，是稳妥后备）。
+- 文件方式（B `cat >` + `pm install 文件`、C sync + `pm install 文件`）降级为最后兜底，并在报错里显式提示"本车机从文件装会解析失败，优先流式"。
+- 报错原文改为「首 300 + 末 900 字符」，避免真正的原因被截掉（v1.0.2 那次就是被截成 `…om fd 1005`）。
+
+### 结论沉淀（写代码/做同类工具时能直接复用）
+
+- **能用流式（`-S`）就别用"先推文件再 `pm install 文件路径`"**：前者不解析文件、不占临时空间，且在部分车机固件上是唯一可行的路。`adb install` 打印的 `Performing Streamed Install` 就是在告诉你走的是这条。
+- 判定"传输是否成功"用**车机侧文件字节数**，不要用车机回不回应答（见 v1.0.2 那节）。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）
-- [ ] 实机复验 v1.0.2：三种安装方式至少一种成功
+- [x] 实机复验 v1.0.2：定位到「本车机 pm install 文件路径会解析失败、必须走流式」✅
+- [ ] 实机复验 v1.0.3：流式安装（A1/A2/A3）应能装上
 - [ ] 大包推送性能：`WRTE` 流控改为窗口化
 - [ ] 后排空间命名按实机校准（不同固件的空间编号可能不同）
 - [ ] 装机后校验：`pm path --user N <pkg>` 确认落点

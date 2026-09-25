@@ -709,14 +709,32 @@ public class MainActivity extends Activity {
         };
 
         String out = null;
+        java.io.File staged = null;
         try {
+            // ---------- 方式 0：把精确字节数拿到手（流式安装必须知道 size；内置资产被 zip 压缩过，openFd 取不到长度）
+            long size = knownSize;
+            StreamFactory src = sf;
+            if (size <= 0) {
+                log("[0] 文件大小未知 → 先缓存到手机本地量准字节数");
+                staged = new java.io.File(getCacheDir(), "carhelper-stage.apk");
+                size = stageLocally(sf, staged);
+                final java.io.File sf2 = staged;
+                src = new StreamFactory() {
+                    public InputStream open() throws IOException {
+                        return new java.io.FileInputStream(sf2);
+                    }
+                };
+                log("[0] 本地缓存完成：" + size + " 字节");
+            }
+            knownSize = size;
+
             // ---------- 方式 A：流式安装（与 `adb install` 同一条路：stdin 直喂 pm/cmd，不落临时文件）
             if (knownSize > 0) {
                 setStatus("正在流式安装 " + label + " …");
                 log("[A] 流式安装：exec:cmd package install -S " + knownSize + " …");
                 String a = adb.streamToService(
                         "exec:cmd package install -S " + knownSize + " -r --user " + uid,
-                        sf.open(), prog, 180000);
+                        src.open(), prog, 180000);
                 if (isInstallOk(a)) {
                     done(label, uid, launch, a, t0);
                     return;
@@ -725,20 +743,29 @@ public class MainActivity extends Activity {
                 log("[A2] 改用 pm install -S 再试 …");
                 String a2 = adb.streamToService(
                         "exec:pm install -S " + knownSize + " -r --user " + uid,
-                        sf.open(), prog, 180000);
+                        src.open(), prog, 180000);
                 if (isInstallOk(a2)) {
                     done(label, uid, launch, a2, t0);
                     return;
                 }
                 log("[A2] 未成功：" + tailOf(a2));
+                log("[A3] 换 shell 通道再走一次流式安装 …");
+                String a3 = adb.streamToService(
+                        "shell:cmd package install -S " + knownSize + " -r --user " + uid,
+                        src.open(), prog, 180000);
+                if (isInstallOk(a3)) {
+                    done(label, uid, launch, a3, t0);
+                    return;
+                }
+                log("[A3] 未成功：" + tailOf(a3));
             } else {
-                log("[A] 跳过流式安装（未知文件大小）");
+                log("[A] 跳过流式安装（文件大小仍未知）");
             }
 
             // ---------- 方式 B：shell 流推到 /data/local/tmp 再装（本机已验证能传大文件的通道）
             setStatus("正在推送 " + label + "（方式 B）…");
             log("[B] 推送文件：cat > " + tmp + " …");
-            long pushed = adb.pushViaShell(sf.open(), tmp, prog);
+            long pushed = adb.pushViaShell(src.open(), tmp, prog);
             long onDevice = deviceFileSize(tmp);
             log("[B] 已推送 " + pushed + " 字节 / 车机侧 " + onDevice + " 字节");
             if (onDevice > 0 && onDevice == pushed) {
@@ -755,7 +782,7 @@ public class MainActivity extends Activity {
             // ---------- 方式 C：sync 推送（容错版，最后兜底）
             setStatus("正在推送 " + label + "（方式 C）…");
             log("[C] sync 推送 " + tmp + " …");
-            long pushed2 = adb.push(sf.open(), tmp, 0644, prog);
+            long pushed2 = adb.push(src.open(), tmp, 0644, prog);
             long onDevice2 = deviceFileSize(tmp);
             log("[C] 已推送 " + pushed2 + " 字节 / 车机侧 " + onDevice2 + " 字节");
             if (onDevice2 > 0 && onDevice2 == pushed2) {
@@ -779,7 +806,43 @@ public class MainActivity extends Activity {
                 adb.shell("rm -f " + tmp);
             } catch (Exception ignored) {
             }
+            if (staged != null && staged.exists()) {
+                try {
+                    staged.delete();
+                } catch (Exception ignored) {
+                }
+            }
         }
+    }
+
+    /** 把源数据落到手机本地文件，返回精确字节数（流式安装要求 size 精确）。 */
+    private long stageLocally(StreamFactory sf, java.io.File dst) throws IOException {
+        InputStream in = sf.open();
+        java.io.FileOutputStream os = new java.io.FileOutputStream(dst);
+        long n = 0;
+        try {
+            byte[] b = new byte[64 * 1024];
+            int r;
+            long next = 30L << 20;
+            while ((r = in.read(b)) > 0) {
+                os.write(b, 0, r);
+                n += r;
+                if (n >= next) {
+                    next += 30L << 20;
+                    log("[0] 已缓存 " + (n >> 20) + " MB …");
+                }
+            }
+        } finally {
+            try {
+                os.close();
+            } catch (IOException ignored) {
+            }
+            try {
+                in.close();
+            } catch (IOException ignored) {
+            }
+        }
+        return n;
     }
 
     private void done(String label, int uid, boolean launch, String out, long t0) throws IOException {
@@ -830,7 +893,8 @@ public class MainActivity extends Activity {
         if (s == null) return "（无输出）";
         String t = s.trim();
         if (t.length() == 0) return "（无输出）";
-        return t.length() > 500 ? "…" + t.substring(t.length() - 500) : t;
+        if (t.length() <= 1200) return t;
+        return t.substring(0, 300) + "\n……（中间省略）……\n" + t.substring(t.length() - 900);
     }
 
     /** 常见 pm install 报错 → 人话建议。 */
@@ -849,6 +913,9 @@ public class MainActivity extends Activity {
             return "建议：APK 解析失败（多半是传输被截断），重试一次；仍失败就把上面原文发我。";
         if (out.contains("INSTALL_FAILED_USER_RESTRICTED"))
             return "建议：车机策略限制了安装来源。";
+        if (out.contains("setParamsSize") || out.contains("parseApkLite") || out.contains("nativeLoadFd"))
+            return "建议：本车机在从 /data/local/tmp 读文件安装时会解析失败（与文件本身无关，字节数是核对过的）"
+                    + "→ 优先用「流式安装」方式（本版会自动走流式）。";
         if (out.contains("No such file") || out.contains("not found"))
             return "建议：车机侧临时文件不见了（推送没落地），请重试。";
         return "建议：把上面这段原文发我，我按错误码定位。";
