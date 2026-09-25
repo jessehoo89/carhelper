@@ -188,11 +188,39 @@ v1.0.2 实机日志给出了完整链条（这次信息量极大）：
 - **能用流式（`-S`）就别用"先推文件再 `pm install 文件路径`"**：前者不解析文件、不占临时空间，且在部分车机固件上是唯一可行的路。`adb install` 打印的 `Performing Streamed Install` 就是在告诉你走的是这条。
 - 判定"传输是否成功"用**车机侧文件字节数**，不要用车机回不回应答（见 v1.0.2 那节）。
 
+
+## v1.0.3 实机验证通过（2026-09-25 深夜）
+
+用户回执：**安装成功** ✅（此前 v1.0.1 的授权只弹一次、空间标签也已确认）。至此三个反馈问题全部闭环。
+
+### 与 LIGHTBOX 的对照（回答"为什么不直接照抄"）
+
+**结构层面本来就是照 LIGHTBOX 的**：网关优先发现 + 48 并发/450ms 探测、RSA 密钥 + `AUTH(2)/(3)` 握手、
+`pm list users`/`am get-current-user` 多空间编排、`pm install-existing --user N`、空间映射 12/13/100/101，
+都来自 `car-hu-api-research/findings/02`。真正踩坑的是**装机机制的分支选择**：
+
+LIGHTBOX 有两条路（`s1/t.java:84-117`），**按 `cmd` 是否支持二选一**：
+
+| 路径 | LIGHTBOX 实现 | 领克900 实测 |
+|---|---|---|
+| **首选：流式安装** | `exec:cmd package install -S <本地文件 length> [-r --user N]`，APK 从 stdin 流进去，判 `Success` | ✅ 可行（= HiSH `adb install` 那条路） |
+| 兜底：文件方式 | `sync:` 推到 `/data/local/tmp/x.apk` → `pm install "<路径>"`（`i2/l.java:401-434`） | ❌ 车机崩在 `setParamsSize→parseApkLite→ApkAssets.nativeLoadFd` |
+
+**我一开始把"兜底路"当主干做了**（classic `adb push` 风格），于是连续两轮实机都卡在这台车不支持的
+文件安装上；最终收敛到 LIGHTBOX 的**首选路**，连两个细节都撞上了同一个结论：
+① 服务名 `exec:cmd`；② `-S` 必须给**本地文件的精确长度**（我们也因此加了"size 未知就先缓存到本地量准"）。
+
+教训：**装机优先用平台自家工具（`adb install`）走的那条路**——带 `-S` 的流式安装，不解析文件、不占临时空间；
+"先推文件再 `pm install 文件路径"` 只能当兜底，别当主干。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）
 - [x] 实机复验 v1.0.2：定位到「本车机 pm install 文件路径会解析失败、必须走流式」✅
-- [ ] 实机复验 v1.0.3：流式安装（A1/A2/A3）应能装上
+- [x] 实机复验 v1.0.3：流式安装成功 ✅（用户回执）
+- [ ] 可选：照 LIGHTBOX 补 `cmd` 能力探测（先探测再选路，省一次失败尝试）
+- [ ] 可选：装后校验 `pm path --user N <pkg>` + `appops set … SYSTEM_ALERT_WINDOW allow`
+- [ ] 可选：shell 命令改用 `shell,v2,raw:`（二进制/退出码更干净）
 - [ ] 大包推送性能：`WRTE` 流控改为窗口化
 - [ ] 后排空间命名按实机校准（不同固件的空间编号可能不同）
 - [ ] 装机后校验：`pm path --user N <pkg>` 确认落点
