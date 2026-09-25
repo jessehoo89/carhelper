@@ -1339,7 +1339,22 @@ public class MainActivity extends Activity {
                     }
                     String listU = adb.shell("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
                     sb.append("· 复核 pm path：").append(left.length() == 0 ? "各空间均已移除 ✅" : "仍存在于空间 " + left).append("\n");
-                    sb.append("· pm list packages -u：").append(listU.length() == 0 ? "无记录 ✅" : listU);
+                    sb.append("· pm list packages -u（含已卸载记录）：").append(listU.length() == 0 ? "无记录 ✅" : listU).append("\n");
+
+                    // ★ 关键诊断：同名"系统/预置"版本？有它的话重签名包永远装不上（那条签名记录卸载不掉）
+                    String sys = adb.shell("pm list packages -s " + pkg + " 2>/dev/null", 30000).trim();
+                    String allUsers = adb.shell("pm list packages --user all " + pkg + " 2>/dev/null", 30000).trim();
+                    String dump = adb.shell("dumpsys package " + pkg + " 2>/dev/null | head -n 40", 30000).trim();
+                    sb.append("· 预置包 pm list packages -s：").append(sys.length() == 0 ? "无（不是预置应用）" : sys).append("\n");
+                    sb.append("· 所有用户：").append(allUsers.length() == 0 ? "无" : allUsers).append("\n");
+                    sb.append("· dumpsys package 摘要：\n").append(tailOf(dump)).append("\n");
+                    boolean systemCopy = sys.length() > 0 || dump.contains("system/") || dump.contains("/product/");
+                    sb.append(systemCopy
+                            ? "❗诊断：车机里存在**预置/系统**的同名应用（或残留指向 /system 的 codePath）——"
+                              + "这种包的签名记录卸载不掉，凡签名与它不同的包（我们的改造版）都装不上。"
+                              + "解决办法：给改造版**改包名**（我可以出个 com.sumsg.musichub.mod 版，与原版共存），把上面这段发我即可。"
+                            : "诊断：未发现预置同名应用；各空间已清理并复核，可直接回卡片②重装。");
+                    sb.append("\n");
                     setStatus(left.length() == 0 ? "已彻底卸载：" + pkg : "仍有残留：" + pkg);
                     log(sb.toString() + (left.length() == 0
                             ? "\n现在可以回卡片②重新安装改造版了。"
