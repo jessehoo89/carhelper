@@ -68,10 +68,27 @@ public class TestMain {
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(args[0]);
         String keyFile = args.length > 1 ? args[1] : null;
+        boolean legacyPhase = args.length > 2 && "legacy".equals(args[2]);
         AdbClient.DEBUG = true;
         MemKeys keys = new MemKeys(keyFile);
         AdbClient adb = new AdbClient(keys);
 
+        if (legacyPhase) {
+            System.out.println("===== 老式 adbd 阶段（只认 mincrypt 语义签名，模拟领克900）=====");
+            authAsked = false;
+            boolean askedL = adb.connect("127.0.0.1", port, 3000, 15000);
+            System.out.println("  公钥已提交=" + askedL + " onAuthRequested=" + authAsked);
+            check("变体1 被拒后自动用变体2 验签通过（未再发公钥、无授权弹框）", !askedL && !authAsked);
+            System.out.println("  认证轨迹: " + adb.authTrace);
+            byte[] d = new byte[40000];
+            new Random(9).nextBytes(d);
+            long nl = adb.push(new java.io.ByteArrayInputStream(d), "/data/local/tmp/legacy.bin", 0644, null);
+            String il = adb.shell("mockinfo /data/local/tmp/legacy.bin").trim();
+            check("老式模式下列功能正常（推送 " + nl + " 字节）", il.contains("size=" + d.length));
+            adb.close();
+            System.out.println(failures == 0 ? "\n全部通过 ✅" : "\n失败 " + failures + " 项 ❌");
+            System.exit(failures == 0 ? 0 : 1);
+        }
         System.out.println("===== 连接 #1（密钥未授权）=====");
         boolean asked = adb.connect("127.0.0.1", port, 3000, 15000);
         System.out.println("  connect() 返回 公钥已提交=" + asked + "，onAuthRequested=" + authAsked);

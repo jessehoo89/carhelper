@@ -119,7 +119,7 @@ public class AdbClient {
         send(A_CNXN, 0x01000000, MAX_DATA, FEATURES.getBytes("UTF-8"));
 
         boolean pubkeySent = false;
-        boolean sigTried = false;
+        int signTries = 0;
         int pubkeySends = 0;
         while (true) {
             Msg m = read();
@@ -130,14 +130,17 @@ public class AdbClient {
                 return pubkeySent;
             } else if (m.cmd == A_AUTH) {
                 authTrace.append("AUTH(type=").append(m.arg0).append(",tokenLen=").append(m.len).append(") ");
-                if (m.arg0 == 1 && !sigTried) {
-                    // TOKEN：先用持久化的私钥签名（密钥已授权时，一步通过、不弹框）
-                    sigTried = true;
+                if (m.arg0 == 1 && signTries < 2) {
+                    // TOKEN：用持久化私钥签名（车机已授权该公钥时一步通过、不弹框）。
+                    // 签名有两种历史语义，不同代 adbd 认的不一样 —— 依次试，都不行才发公钥：
+                    //   变体1 SHA1withRSA          = PKCS#1 v1.5 over SHA1(token)   （现代 adbd：RSA_verify(NID_sha1, token,…)）
+                    //   变体2 裸 RSA + 固定前缀      = 把 token 当"已算好的摘要"       （mincrypt 语义，LIGHTBOX/本车机认这个）
+                    signTries++;
                     ensureKey();
-                    byte[] sig = signToken(m.data);
+                    byte[] sig = signTries == 1 ? signToken(m.data) : signTokenLegacy(m.data);
                     if (sig != null) {
                         send(A_AUTH, 2, 0, sig);
-                        authTrace.append("→ 已发签名; ");
+                        authTrace.append("→ 已发签名(变体").append(signTries).append("); ");
                         continue;
                     }
                     authTrace.append("→ 签名失败; ");
@@ -149,7 +152,7 @@ public class AdbClient {
                 }
                 pubkeySends++;
                 pubkeySent = true;
-                sigTried = false; // 授权通过后车机会再发 TOKEN，我们要能再签一次
+                signTries = 0; // 授权通过后车机会再发 TOKEN，我们要能再签一次
                 if (keys != null) keys.onAuthRequested();
                 ensureKey();
                 send(A_AUTH, 3, 0, adbPublicKeyBytes());
@@ -217,6 +220,38 @@ public class AdbClient {
             return sb.toString();
         } catch (Exception e) {
             return "?";
+        }
+    }
+
+    /**
+     * 变体2：把 token 当作"已算好的摘要"，手工拼 PKCS#1 v1.5 块后用裸 RSA 加密。
+     *
+     * 块结构（2048 位 = 256 字节）：
+     *   00 01 | FF ×(256-3-15-tokenLen) | 00 | 30 21 30 09 06 05 2B 0E 03 02 1A 05 00 04 14 | token
+     *                                              └── SHA-1 的 DigestInfo 前缀（15 字节）
+     * 依据：老 adbd（mincrypt `RSA_verify`）直接拿 token 与块尾 20 字节比较，不再做一次 SHA1；
+     *      实测本车机（领克900）拒绝变体1、接受这种写法，LIGHTBOX 也是这么签的。
+     */
+    private byte[] signTokenLegacy(byte[] token) {
+        try {
+            final byte[] SHA1_PREFIX = {
+                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
+            };
+            int size = 256;                                  // RSA-2048
+            int padLen = size - 3 - SHA1_PREFIX.length - token.length;
+            if (padLen < 8) return signToken(token);         // 长度不合适就退回变体1
+            ByteBuffer b = ByteBuffer.allocate(size);
+            b.put((byte) 0x00);
+            b.put((byte) 0x01);
+            for (int i = 0; i < padLen; i++) b.put((byte) 0xFF);
+            b.put((byte) 0x00);
+            b.put(SHA1_PREFIX);
+            b.put(token);
+            javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("RSA/ECB/NoPadding");
+            c.init(javax.crypto.Cipher.ENCRYPT_MODE, priv);
+            return c.doFinal(b.array());
+        } catch (Exception e) {
+            return null;
         }
     }
 

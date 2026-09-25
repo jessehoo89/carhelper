@@ -85,6 +85,35 @@ def read_msg(c):
 
 # ---------------------------------------------------------------- 密钥校验
 
+SHA1_PREFIX = bytes.fromhex('3021300906052b0e03021a05000414')
+
+
+def rsa_verify_legacy(pub, sig, token):
+    """mincrypt 语义：块 = 00 01 FF..FF 00 || DigestInfo(SHA1) || token（token 当摘要，不再哈希）。"""
+    n, e = pub
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k:
+        return False
+    try:
+        em = pow(int.from_bytes(sig, 'big'), e, n).to_bytes(k, 'big')
+    except Exception:
+        return False
+    pad = k - 3 - len(SHA1_PREFIX) - len(token)
+    if pad < 8:
+        return False
+    exp = b'\x00\x01' + b'\xff' * pad + b'\x00' + SHA1_PREFIX + token
+    if em != exp:
+        if not globals().get('_LEGACY_QUIET'):
+            pass
+        log('  [legacy 不匹配] k=%d tokenLen=%d pad=%d' % (k, len(token), pad))
+        log('    em 头16: %s' % em[:16].hex())
+        log('    em 尾32: %s' % em[-32:].hex())
+        log('    exp头16: %s' % exp[:16].hex())
+        log('    exp尾32: %s' % exp[-32:].hex())
+        return False
+    return True
+
+
 def rsa_verify_sha1(pub, sig, data):
     n, e = pub
     k = (n.bit_length() + 7) // 8
@@ -169,6 +198,7 @@ class Stream(object):
 class Adbd(object):
     def __init__(self, keys_file, expect_data=None):
         self.keys_file = keys_file
+        self.legacy_only = os.environ.get('MOCK_LEGACY_ONLY') == '1'   # 只认 mincrypt 语义（模拟领克900）
         self.authorized = set()
         self.pubs = []
         if os.path.exists(keys_file):
@@ -248,12 +278,17 @@ class Adbd(object):
                     open(self.keys_file, 'w').write('\n'.join(sorted(self.authorized)))
                 continue
             if a0 == 2:
+                # 与 adbd 一致：用"已授权密钥集合"验签（不看本次会话是否收到公钥）
                 for pub in self.pubs:
-                    if rsa_verify_sha1(pub, data, token):
-                        log('✅ 签名校验通过（命中已授权密钥）→ 设备就绪')
+                    if not self.legacy_only and rsa_verify_sha1(pub, data, token):
+                        log('✅ 变体1(SHA1(token)) 验签通过 → 设备就绪，未再发公钥')
                         send_msg(c, CNXN, 0x01000000, MAX_PAYLOAD, b'device::mock\0')
                         return
-                log('签名与已授权密钥不匹配 → 再发 AUTH(TOKEN)')
+                    if rsa_verify_legacy(pub, data, token):
+                        log('✅ 变体2(token 当摘要/mincrypt) 验签通过 → 设备就绪，未再发公钥')
+                        send_msg(c, CNXN, 0x01000000, MAX_PAYLOAD, b'device::mock\0')
+                        return
+                log('两种签名的验签都没过 → 再发 AUTH(TOKEN)' + ('（本 mock 只认变体2）' if self.legacy_only else ''))
                 continue
             raise ValueError('unexpected AUTH arg0=%d' % a0)
 
