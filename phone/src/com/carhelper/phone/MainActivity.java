@@ -130,6 +130,7 @@ public class MainActivity extends Activity {
 
     private void boot() {
         setStatus("就绪");
+        startKeepAlive();
         log("请确保：① 手机已连车机热点（Lynk&Co）② 车辆处于 P 挡、车机屏已唤醒。\n然后点「一键连接车机」。\n"
                 + "首次连接：车机屏会弹「允许调试」授权框，点「允许」即可（本机会记住密钥，之后连接不再弹）。");
     }
@@ -210,6 +211,18 @@ public class MainActivity extends Activity {
         LinearLayout c1 = card(root, "① 连接车机", "一键完成：检测热点 → 发现车机 → 连接 ADB");
         c1.addView(btn("一键连接车机", "#1F6FEB", new Runnable() {
             public void run() { oneClickConnect(); }
+        }));
+        c1.addView(gap(8));
+        c1.addView(btn("重连车机（快速，跳过扫描）", "#30363D", new Runnable() {
+            public void run() {
+                setStatus("正在重连 …");
+                new Thread(new Runnable() {
+                    public void run() {
+                        boolean ok = reconnect();
+                        setStatus(ok ? "已重连 " + carIp + ":5555" : "重连失败，请点「一键连接车机」");
+                    }
+                }).start();
+            }
         }));
         c1.addView(gap(8));
         c1.addView(btn("检查车机是否已记住本机密钥", "#30363D", new Runnable() {
@@ -551,7 +564,7 @@ public class MainActivity extends Activity {
             public void run() {
                 try {
                     String mine = adb.publicKeyBase64();
-                    String dump = adb.shell("cat /data/misc/adb/adb_keys 2>&1", 30000).trim();
+                    String dump = sh("cat /data/misc/adb/adb_keys 2>&1", 30000).trim();
                     StringBuilder sb = new StringBuilder("车机 /data/misc/adb/adb_keys：\n");
                     boolean found = false;
                     int n = 0;
@@ -588,6 +601,105 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /** 有耗时操作（安装/大量命令）时置位，心跳线程不去打扰同一条 socket。 */
+    private volatile boolean busy = false;
+    private volatile boolean keepAliveRun = true;
+
+    /** 所有 shell 命令统一入口：**断线时自动快速重连并重试一次**。 */
+    private String sh(String cmd) throws IOException {
+        return sh(cmd, -1);
+    }
+
+    /** 串行化所有 ADB 访问（心跳与用户操作不能同时读写同一条 socket）。 */
+    private final Object adbLock = new Object();
+
+    private String sh(String cmd, int timeoutMs) throws IOException {
+        synchronized (adbLock) {
+            try {
+                return timeoutMs > 0 ? adb.shell(cmd, timeoutMs) : adb.shell(cmd);
+            } catch (IOException e) {
+                log("连接被中断（" + nz(e.getMessage()) + "）→ 自动重连并重试 …");
+                if (!reconnect()) throw new IOException("重连失败：" + e.getMessage());
+                return timeoutMs > 0 ? adb.shell(cmd, timeoutMs) : adb.shell(cmd);
+            }
+        }
+    }
+
+    /**
+     * 快速重连：**优先直连上次成功的 IP**（车机热点 IP 基本不变），失败才走完整发现流程。
+     * 密钥已持久化，重连不会再弹授权框。
+     */
+    private boolean reconnect() {
+        synchronized (adbLock) {
+        if (adb != null && adb.isConnected()) {
+            connected = true;
+            return true;
+        }
+        connected = false;
+        try {
+            if (carIp != null) {
+                try {
+                    adb.close();
+                    authAsked = adb.connect(carIp, 5555, 5000, 60000);
+                    connected = true;
+                    log("已重连 " + carIp + ":5555（轨迹：" + adb.authTrace.toString() + "）");
+                    return true;
+                } catch (Exception e) {
+                    log("直连 " + carIp + " 失败：" + nz(e.getMessage()) + " → 重新发现车机 …");
+                }
+            }
+            wifi = CarFinder.currentWifi(this);
+            if (wifi == null) {
+                log("重连失败：当前不是 WiFi（请确认仍连着车机热点）");
+                return false;
+            }
+            List<String> hits = CarFinder.discover(this, wifi, 450);
+            for (String ip : hits) {
+                try {
+                    adb.close();
+                    authAsked = adb.connect(ip, 5555, 6000, 60000);
+                    carIp = ip;
+                    connected = true;
+                    log("已重连 " + ip + ":5555");
+                    return true;
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception e) {
+            log("重连失败：" + nz(e.getMessage()));
+        }
+        return false;
+        }
+    }
+
+    /** 心跳保活：空闲时每 45 秒轻量 ping 一次，断了就自动重连（车机休眠/热点抖动导致的断链常见）。 */
+    private void startKeepAlive() {
+        new Thread(new Runnable() {
+            public void run() {
+                while (keepAliveRun) {
+                    try {
+                        Thread.sleep(45000L);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (busy || !connected) continue;
+                    try {
+                        if (!adb.isConnected()) {
+                            log("[心跳] 连接已断 → 自动重连 …");
+                            reconnect();
+                        } else {
+                            sh("echo k", 15000);
+                        }
+                    } catch (Exception e) {
+                        log("[心跳] ping 失败（" + nz(e.getMessage()) + "）→ 自动重连 …");
+                        connected = false;
+                        reconnect();
+                    }
+                }
+            }
+        }, "adb-keepalive").start();
+    }
+
     private void fail(final String msg) {
         ui.post(new Runnable() {
             public void run() {
@@ -603,7 +715,7 @@ public class MainActivity extends Activity {
 
     /** 采集设备特征 + 用户空间，判定前排/后排，筛出可用安装空间。 */
     private void probeDevice() throws Exception {
-        String out = adb.shell(
+        String out = sh(
                 "printf 'SERIAL=';getprop ro.serialno;"
                         + "printf ';MODEL=';getprop ro.product.model;"
                         + "printf ';PRODUCT=';getprop ro.product.name;"
@@ -827,6 +939,7 @@ public class MainActivity extends Activity {
      *  所以现在**不以应答判定成败，一律以车机上文件大小 / pm install 输出为准**。
      */
     private void install(StreamFactory sf, String label, boolean launch, long knownSize) {
+        busy = true;
         final long t0 = System.currentTimeMillis();
         String tmp = "/data/local/tmp/carhelper-" + System.currentTimeMillis() + ".apk";
         final int uid = chosenUser >= 0 ? chosenUser : 0;
@@ -954,8 +1067,9 @@ public class MainActivity extends Activity {
                     + "\n若为链路无应答：确认手机仍连着车机热点、离车近一点再试；"
                     + "若反复失败，请在 HiSH 里跑 `adb shell df /data` 和 `adb shell ls -l /data/local/tmp` 把结果发我。");
         } finally {
+            busy = false;
             try {
-                adb.shell("rm -f " + tmp);
+                sh("rm -f " + tmp);
             } catch (Exception ignored) {
             }
             if (staged != null && staged.exists()) {
@@ -1019,11 +1133,11 @@ public class MainActivity extends Activity {
     private void postConfigFullscreen(int uid) {
         final String pkg = "com.carhelper.fullscreen";
         try {
-            String r1 = adb.shell("appops set --user " + uid + " " + pkg
+            String r1 = sh("appops set --user " + uid + " " + pkg
                     + " SYSTEM_ALERT_WINDOW allow 2>&1", 30000).trim();
-            String r2 = adb.shell("am start-foreground-service --user " + uid + " -n "
+            String r2 = sh("am start-foreground-service --user " + uid + " -n "
                     + pkg + "/" + pkg + ".FullscreenService 2>&1", 30000).trim();
-            String r3 = adb.shell("appops get --user " + uid + " " + pkg
+            String r3 = sh("appops get --user " + uid + " " + pkg
                     + " SYSTEM_ALERT_WINDOW 2>&1", 30000).trim();
             log("装后配置（万物全屏）：\n"
                     + "· 授权悬浮窗 → " + nz(r1) + "\n"
@@ -1048,7 +1162,13 @@ public class MainActivity extends Activity {
 
     /** 跑一条不需要 stdin 的车机命令，收集输出直到结果行或超时。 */
     private String runOnDevice(String service, int tailWaitMs) throws IOException {
-        return adb.streamToService(service, new java.io.ByteArrayInputStream(new byte[0]), null, tailWaitMs);
+        try {
+            return adb.streamToService(service, new java.io.ByteArrayInputStream(new byte[0]), null, tailWaitMs);
+        } catch (IOException e) {
+            log("通道中断（" + nz(e.getMessage()) + "）→ 自动重连并重试 …");
+            if (!reconnect()) throw e;
+            return adb.streamToService(service, new java.io.ByteArrayInputStream(new byte[0]), null, tailWaitMs);
+        }
     }
 
     private static boolean isInstallOk(String out) {
@@ -1058,7 +1178,7 @@ public class MainActivity extends Activity {
     /** 车机上文件的大小（字节），读不到返回 -1。 */
     private long deviceFileSize(String path) {
         try {
-            String s = adb.shell("toybox stat -c %s " + path + " 2>/dev/null || ls -l " + path).trim();
+            String s = sh("toybox stat -c %s " + path + " 2>/dev/null || ls -l " + path).trim();
             if (s.length() == 0) return -1;
             return firstNumber(s);
         } catch (Exception e) {
@@ -1077,7 +1197,7 @@ public class MainActivity extends Activity {
     /** 车机 /data 可用空间（KB），读不到返回 -1。 */
     private long dataFreeKb() {
         try {
-            String s = adb.shell("df -k /data 2>/dev/null | tail -n 1 | awk '{print $4}'").trim();
+            String s = sh("df -k /data 2>/dev/null | tail -n 1 | awk '{print $4}'").trim();
             return Long.parseLong(s.replaceAll("[^0-9]", ""));
         } catch (Exception e) {
             return -1;
@@ -1189,12 +1309,13 @@ public class MainActivity extends Activity {
 
     private void loadSpacesAndApps() {
         if (!ensureConnected()) return;
+        busy = true;
         setStatus("正在读取空间与应用 …");
         new Thread(new Runnable() {
             public void run() {
                 try {
                     // 1) 刷新用户空间与活跃空间（活跃空间可能被车主切换过）
-                    String info = adb.shell("printf 'USER=';am get-current-user;"
+                    String info = sh("printf 'USER=';am get-current-user;"
                             + "printf ';USERS=';pm list users | tr '\\n' '|'");
                     activeUser = parseIntSafe(seg(info, "USER="));
                     rawUserList = seg(info, "USERS=").trim();
@@ -1209,7 +1330,7 @@ public class MainActivity extends Activity {
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         int uid = deviceUsers.get(i).intValue();
                         // 全部包（含系统/预置）——用于关键字搜索，方便找"预置同名包"这类装不上的元凶
-                        String anyOut = adb.shell("pm list packages -u --user " + uid + " 2>/dev/null");
+                        String anyOut = sh("pm list packages -u --user " + uid + " 2>/dev/null");
                         for (String line : anyOut.split("\n")) {
                             String t = line.trim();
                             if (t.startsWith("package:")) {
@@ -1217,7 +1338,7 @@ public class MainActivity extends Activity {
                                 if (!allPkgsAny.contains(pk)) allPkgsAny.add(pk);
                             }
                         }
-                        String out = adb.shell("pm list packages -3 --user " + uid + " 2>/dev/null");
+                        String out = sh("pm list packages -3 --user " + uid + " 2>/dev/null");
                         for (String line : out.split("\n")) {
                             String t = line.trim();
                             if (!t.startsWith("package:")) continue;
@@ -1237,7 +1358,7 @@ public class MainActivity extends Activity {
                     // 3) 屏幕归属旁证（display ↔ user，仅打到日志里，用于核对/校正标签）
                     String evidence = "";
                     try {
-                        evidence = adb.shell("dumpsys activity activities 2>/dev/null "
+                        evidence = sh("dumpsys activity activities 2>/dev/null "
                                 + "| grep -E 'Display #|U=[0-9]+' | head -n 24 | tr '\\n' '|'", 25000).trim();
                         if (evidence.length() > 700) evidence = evidence.substring(0, 700) + " …";
                     } catch (Exception ignored) {
@@ -1258,6 +1379,8 @@ public class MainActivity extends Activity {
                 } catch (Exception e) {
                     setStatus("读取失败");
                     log("读取失败：" + e.getMessage());
+                } finally {
+                    busy = false;
                 }
             }
         }).start();
@@ -1360,31 +1483,31 @@ public class MainActivity extends Activity {
                     // 1) 先按空间逐个摘（system app 也只能这样摘）
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         int uid = deviceUsers.get(i).intValue();
-                        String r = adb.shell("pm uninstall --user " + uid + " " + pkg + " 2>&1", 60000).trim();
+                        String r = sh("pm uninstall --user " + uid + " " + pkg + " 2>&1", 60000).trim();
                         sb.append("· user ").append(uid).append("：").append(nz(r)).append("\n");
                     }
                     // 2) 再"对所有用户"卸载一次，清掉残留记录
-                    String all = adb.shell("pm uninstall " + pkg + " 2>&1", 60000).trim();
+                    String all = sh("pm uninstall " + pkg + " 2>&1", 60000).trim();
                     sb.append("· 所有用户：").append(nz(all)).append("\n");
-                    adb.shell("pm clear " + pkg + " 2>&1", 30000);
+                    sh("pm clear " + pkg + " 2>&1", 30000);
 
                     // 3) 逐空间复核：还有哪个空间留着它
                     StringBuilder left = new StringBuilder();
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         int uid = deviceUsers.get(i).intValue();
-                        String p = adb.shell("pm path --user " + uid + " " + pkg + " 2>/dev/null", 30000);
+                        String p = sh("pm path --user " + uid + " " + pkg + " 2>/dev/null", 30000);
                         if (p.contains("package:")) {
                             left.append(uid).append(" ");
                         }
                     }
-                    String listU = adb.shell("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
+                    String listU = sh("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
                     sb.append("· 复核 pm path：").append(left.length() == 0 ? "各空间均已移除 ✅" : "仍存在于空间 " + left).append("\n");
                     sb.append("· pm list packages -u（含已卸载记录）：").append(listU.length() == 0 ? "无记录 ✅" : listU).append("\n");
 
                     // ★ 关键诊断：同名"系统/预置"版本？有它的话重签名包永远装不上（那条签名记录卸载不掉）
-                    String sys = adb.shell("pm list packages -s " + pkg + " 2>/dev/null", 30000).trim();
-                    String allUsers = adb.shell("pm list packages --user all " + pkg + " 2>/dev/null", 30000).trim();
-                    String dump = adb.shell("dumpsys package " + pkg + " 2>/dev/null | head -n 40", 30000).trim();
+                    String sys = sh("pm list packages -s " + pkg + " 2>/dev/null", 30000).trim();
+                    String allUsers = sh("pm list packages --user all " + pkg + " 2>/dev/null", 30000).trim();
+                    String dump = sh("dumpsys package " + pkg + " 2>/dev/null | head -n 40", 30000).trim();
                     sb.append("· 预置包 pm list packages -s：").append(sys.length() == 0 ? "无（不是预置应用）" : sys).append("\n");
                     sb.append("· 所有用户：").append(allUsers.length() == 0 ? "无" : allUsers).append("\n");
                     sb.append("· dumpsys package 摘要：\n").append(tailOf(dump)).append("\n");
@@ -1437,7 +1560,7 @@ public class MainActivity extends Activity {
                             : ("pm uninstall --user " + uid + " " + pkg);
                     try {
                         sb.append(uid).append(" · ").append(spaceLabel(uid)).append(" → ")
-                                .append(adb.shell(cmd).trim()).append("\n");
+                                .append(sh(cmd).trim()).append("\n");
                     } catch (Exception e) {
                         sb.append(uid).append(" · ").append(spaceLabel(uid))
                                 .append(" → 异常: ").append(e.getMessage()).append("\n");
@@ -1460,11 +1583,11 @@ public class MainActivity extends Activity {
     }
 
     private boolean ensureConnected() {
-        if (!connected || !adb.isConnected()) {
-            log("还没连上车机，请先在卡片①点「一键连接车机」。");
-            return false;
-        }
-        return true;
+        if (connected && adb.isConnected()) return true;
+        log("连接已断开 → 自动尝试重连 …");
+        if (reconnect()) return true;
+        log("还没连上车机，请先在卡片①点「一键连接车机」。");
+        return false;
     }
 
     private static String seg(String src, String key) {

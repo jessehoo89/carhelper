@@ -110,6 +110,10 @@ public class AdbClient {
         sock = new Socket();
         sock.connect(new InetSocketAddress(host, port), connectTimeoutMs);
         sock.setTcpNoDelay(true);
+        try {
+            sock.setKeepAlive(true);   // 缓解车机/热点空闲断链
+        } catch (Throwable ignored) {
+        }
         // 握手期给用户留出点车机授权框的时间
         sock.setSoTimeout(Math.max(readTimeoutMs, 120000));
         in = sock.getInputStream();
