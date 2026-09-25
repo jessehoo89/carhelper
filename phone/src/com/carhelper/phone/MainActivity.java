@@ -177,14 +177,101 @@ public class MainActivity extends Activity {
         return d;
     }
 
+    /** 页面：0=主页 1=安装 2=授权管理 3=日志 */
+    private static final int PAGE_HOME = 0, PAGE_INSTALL = 1, PAGE_MANAGE = 2, PAGE_LOG = 3;
+    private int currentPage = PAGE_HOME;
+    private View[] pages = new View[4];
+    private TextView installStatus, manageStatus, installSummary, manageSummary, homeLogLine;
+
     private View buildUi() {
+        LinearLayout host = new LinearLayout(this);
+        host.setOrientation(LinearLayout.VERTICAL);
+        host.setBackgroundColor(Color.parseColor("#0B0E11"));
+        for (int i = 0; i < 4; i++) {
+            pages[i] = null;
+        }
+        pages[PAGE_HOME] = buildHomePage();
+        pages[PAGE_INSTALL] = buildInstallPage();
+        pages[PAGE_MANAGE] = buildManagePage();
+        pages[PAGE_LOG] = buildLogPage();
+        for (int i = 0; i < 4; i++) {
+            pages[i].setVisibility(i == PAGE_HOME ? View.VISIBLE : View.GONE);
+            host.addView(pages[i], new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT));
+        }
+        return host;
+    }
+
+    private void showPage(int page) {
+        currentPage = page;
+        for (int i = 0; i < 4; i++) {
+            pages[i].setVisibility(i == page ? View.VISIBLE : View.GONE);
+        }
+        if (page == PAGE_HOME) refresh();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (currentPage != PAGE_HOME) {
+            showPage(PAGE_HOME);
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    private ScrollView page() {
         ScrollView sc = new ScrollView(this);
         sc.setBackgroundColor(Color.parseColor("#0B0E11"));
+        return sc;
+    }
+
+    private LinearLayout pageRoot(ScrollView sc) {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         int p = dp(16);
         root.setPadding(p, p, p, p);
         sc.addView(root);
+        return root;
+    }
+
+    /** 子页顶栏：返回 + 标题 */
+    private void pageHeader(LinearLayout root, String title) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        Button back = mkBtn("‹ 返回", "#30363D", new Runnable() {
+            public void run() { showPage(PAGE_HOME); }
+        });
+        back.setLayoutParams(new LinearLayout.LayoutParams(dp(96), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(back);
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(21);
+        t.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(12);
+        row.addView(t, lp);
+        root.addView(row);
+        root.addView(gap(12));
+    }
+
+    /** 执行状态区（每个功能页自己一块，简要显示"正在做什么/上次结果"） */
+    private TextView statusBox(String initial) {
+        TextView tv = new TextView(this);
+        tv.setText(initial);
+        tv.setTextColor(Color.parseColor("#9FE870"));
+        tv.setTextSize(13);
+        tv.setPadding(dp(14), dp(12), dp(14), dp(12));
+        tv.setBackground(bg("#151A20", 12));
+        return tv;
+    }
+
+    // ---------------------------------------------------------------- 主页
+
+    private View buildHomePage() {
+        ScrollView sc = page();
+        LinearLayout root = pageRoot(sc);
 
         TextView t = new TextView(this);
         t.setText("车机助手");
@@ -207,8 +294,8 @@ public class MainActivity extends Activity {
         statusView.setBackground(bg("#151A20", 12));
         root.addView(statusView);
 
-        // ---------------- 卡片 ① 连接车机 ----------------
-        LinearLayout c1 = card(root, "① 连接车机", "一键完成：检测热点 → 发现车机 → 连接 ADB");
+        // ---- 连接车机 ----
+        LinearLayout c1 = card(root, "① 连接车机", "一键完成：检测热点 → 发现车机 → 连接 ADB（密钥已保存，授权一次长期免弹）");
         c1.addView(btn("一键连接车机", "#1F6FEB", new Runnable() {
             public void run() { oneClickConnect(); }
         }));
@@ -224,23 +311,69 @@ public class MainActivity extends Activity {
                 }).start();
             }
         }));
-        c1.addView(gap(8));
-        c1.addView(btn("检查车机是否已记住本机密钥", "#30363D", new Runnable() {
-            public void run() { checkAuthKeys(); }
-        }));
 
-        // ---------------- 卡片 ② 安装应用 ----------------
-        LinearLayout c2 = card(root, "② 安装应用到车机", "选择要安装到哪块屏幕（按当前热点自动筛除不可用空间）");
+        // ---- 功能入口 ----
+        LinearLayout c2 = card(root, "② 功能", "各功能独立成页，进入后在页内看执行状态");
+        c2.addView(entry("安装应用到车机", "选 APK → 装到指定屏幕空间", "#238636", new Runnable() {
+            public void run() { showPage(PAGE_INSTALL); }
+        }));
+        installSummary = summaryLine("尚未安装过。");
+        c2.addView(installSummary);
+        c2.addView(gap(10));
+        c2.addView(entry("应用授权空间管理", "给已装应用授权/取消授权到指定空间", "#8957E5", new Runnable() {
+            public void run() { showPage(PAGE_MANAGE); }
+        }));
+        manageSummary = summaryLine("尚未加载列表。");
+        c2.addView(manageSummary);
+        c2.addView(gap(10));
+        c2.addView(entry("运行日志", "复制日志发给作者排障", "#30363D", new Runnable() {
+            public void run() { showPage(PAGE_LOG); }
+        }));
+        homeLogLine = summaryLine("（无日志）");
+        c2.addView(homeLogLine);
+        return sc;
+    }
+
+    private Button entry(String text, String desc, String color, final Runnable action) {
+        Button b = mkBtn(text, color, action);
+        b.setTextSize(17);
+        b.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        b.setContentDescription(desc);
+        return b;
+    }
+
+    private TextView summaryLine(String s) {
+        TextView tv = new TextView(this);
+        tv.setText(s);
+        tv.setTextColor(Color.parseColor("#8B949E"));
+        tv.setTextSize(12);
+        tv.setPadding(dp(4), dp(-4) + dp(6), dp(4), 0);
+        return tv;
+    }
+
+    // ---------------------------------------------------------------- 安装页
+
+    private View buildInstallPage() {
+        ScrollView sc = page();
+        LinearLayout root = pageRoot(sc);
+        pageHeader(root, "安装应用到车机");
+
+        installStatus = statusBox("就绪。");
+        root.addView(installStatus);
+
+        LinearLayout c = card(root, "目标屏幕空间", "按当前热点自动筛除不可用空间");
         spaceHint = new TextView(this);
         spaceHint.setTextColor(Color.parseColor("#7A8894"));
         spaceHint.setTextSize(12);
         spaceHint.setPadding(0, dp(6), 0, dp(6));
         spaceHint.setText("连接后自动识别可用屏幕。");
-        c2.addView(spaceHint);
+        c.addView(spaceHint);
         spaceGroup = new RadioGroup(this);
         spaceGroup.setOrientation(RadioGroup.VERTICAL);
-        c2.addView(spaceGroup);
-        c2.addView(gap(6));
+        c.addView(spaceGroup);
+
+        LinearLayout c2 = card(root, "安装", null);
         c2.addView(btn("选择本地 APK 安装", "#238636", new Runnable() {
             public void run() { pickApk(); }
         }));
@@ -262,13 +395,28 @@ public class MainActivity extends Activity {
                 }).start();
             }
         }));
+        c2.addView(gap(8));
+        c2.addView(btn("查看运行日志", "#30363D", new Runnable() {
+            public void run() { showPage(PAGE_LOG); }
+        }));
+        return sc;
+    }
 
-        // ---------------- 卡片 ③ 授权空间管理 ----------------
-        LinearLayout c3 = card(root, "③ 应用授权空间管理", "给已装应用批量授权 / 取消授权到指定空间");
+    // ---------------------------------------------------------------- 授权管理页
+
+    private View buildManagePage() {
+        ScrollView sc = page();
+        LinearLayout root = pageRoot(sc);
+        pageHeader(root, "应用授权空间管理");
+
+        manageStatus = statusBox("就绪。点「加载空间与应用列表」开始。");
+        root.addView(manageStatus);
+
+        LinearLayout c3 = card(root, "空间与应用", "空间可多选；应用点选一个（可搜索）");
         c3.addView(btn("加载空间与应用列表", "#8957E5", new Runnable() {
             public void run() { loadSpacesAndApps(); }
         }));
-        c3.addView(gap(8));
+        c3.addView(gap(10));
         TextView st = new TextView(this);
         st.setText("空间（可多选）");
         st.setTextColor(Color.parseColor("#8B949E"));
@@ -277,9 +425,9 @@ public class MainActivity extends Activity {
         spaceBox = new LinearLayout(this);
         spaceBox.setOrientation(LinearLayout.VERTICAL);
         c3.addView(spaceBox);
-        c3.addView(gap(8));
+        c3.addView(gap(10));
         TextView at = new TextView(this);
-        at.setText("应用（点选一个，可搜索）");
+        at.setText("应用（点选一个，可搜索；输关键字时会连预置/残留包一起搜）");
         at.setTextColor(Color.parseColor("#8B949E"));
         at.setTextSize(12);
         c3.addView(at);
@@ -301,24 +449,33 @@ public class MainActivity extends Activity {
         appBox = new LinearLayout(this);
         appBox.setOrientation(LinearLayout.VERTICAL);
         c3.addView(appBox);
-        c3.addView(gap(8));
-        c3.addView(btn("授权到选中空间", "#238636", new Runnable() {
+
+        LinearLayout c4 = card(root, "操作", null);
+        c4.addView(btn("授权到选中空间", "#238636", new Runnable() {
             public void run() { applySpaces(true); }
         }));
-        c3.addView(gap(8));
-        c3.addView(btn("从选中空间取消授权", "#DA3633", new Runnable() {
+        c4.addView(gap(8));
+        c4.addView(btn("从选中空间取消授权", "#DA3633", new Runnable() {
             public void run() { applySpaces(false); }
         }));
-        c3.addView(gap(8));
-        c3.addView(btn("彻底卸载（所有空间，清残留）", "#8B1E1E", new Runnable() {
+        c4.addView(gap(8));
+        c4.addView(btn("彻底卸载（所有空间，清残留）", "#8B1E1E", new Runnable() {
             public void run() { purgePackage(null); }
         }));
-        c3.addView(gap(8));
+        c4.addView(gap(8));
+        c4.addView(btn("诊断：该应用在各空间的安装状态", "#1F6FEB", new Runnable() {
+            public void run() { dumpUsers(); }
+        }));
+        c4.addView(gap(8));
+        c4.addView(btn("刷新主驾桌面（重启 launcher）", "#8957E5", new Runnable() {
+            public void run() { refreshLauncher(); }
+        }));
+        c4.addView(gap(10));
         TextView pt = new TextView(this);
         pt.setText("列表里搜不到时，直接输包名（如 com.sumsg.musichub）");
         pt.setTextColor(Color.parseColor("#8B949E"));
         pt.setTextSize(12);
-        c3.addView(pt);
+        c4.addView(pt);
         pkgInput = new EditText(this);
         pkgInput.setHint("包名，如 com.sumsg.musichub");
         pkgInput.setInputType(InputType.TYPE_CLASS_TEXT);
@@ -326,50 +483,54 @@ public class MainActivity extends Activity {
         pkgInput.setHintTextColor(Color.parseColor("#586069"));
         pkgInput.setBackground(bg("#0F1418", 10));
         pkgInput.setPadding(dp(12), dp(10), dp(12), dp(10));
-        c3.addView(pkgInput);
-        c3.addView(gap(8));
-        c3.addView(btn("诊断：该应用在各空间的安装状态", "#1F6FEB", new Runnable() {
-            public void run() { dumpUsers(); }
-        }));
-        c3.addView(gap(8));
-        c3.addView(btn("刷新主驾桌面（重启 launcher）", "#8957E5", new Runnable() {
-            public void run() { refreshLauncher(); }
-        }));
-        c3.addView(gap(8));
-        c3.addView(btn("诊断 + 彻底卸载这个包名", "#8B1E1E", new Runnable() {
+        c4.addView(pkgInput);
+        c4.addView(gap(8));
+        c4.addView(btn("诊断 + 彻底卸载这个包名", "#8B1E1E", new Runnable() {
             public void run() {
                 String v = pkgInput.getText().toString().trim();
-                if (v.length() == 0) { log("请先输入包名。"); return; }
+                if (v.length() == 0) {
+                    log("请先输入包名。");
+                    return;
+                }
                 purgePackage(v);
             }
         }));
+        c4.addView(gap(8));
+        c4.addView(btn("查看运行日志", "#30363D", new Runnable() {
+            public void run() { showPage(PAGE_LOG); }
+        }));
+        return sc;
+    }
 
-        // ---------------- 卡片 ④ 日志 ----------------
-        LinearLayout c4 = card(root, "④ 运行日志", "长日志请点「复制日志」，粘给我即可定位");
-        LinearLayout logBtns = new LinearLayout(this);
-        logBtns.setOrientation(LinearLayout.HORIZONTAL);
-        Button cp = btn("复制日志", "#30363D", new Runnable() {
+    // ---------------------------------------------------------------- 日志页
+
+    private View buildLogPage() {
+        ScrollView sc = page();
+        LinearLayout root = pageRoot(sc);
+        pageHeader(root, "运行日志");
+
+        LinearLayout c = card(root, "日志", "长日志请点「复制日志」粘给作者");
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        Button cp = mkBtn("复制日志", "#30363D", new Runnable() {
             public void run() { copyLog(); }
         });
-        Button cl = btn("清空日志", "#30363D", new Runnable() {
+        cp.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        Button cl = mkBtn("清空日志", "#30363D", new Runnable() {
             public void run() { clearLog(); }
         });
-        LinearLayout.LayoutParams hw = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        cp.setLayoutParams(hw);
-        LinearLayout.LayoutParams hw2 = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        hw2.leftMargin = dp(8);
-        cl.setLayoutParams(hw2);
-        logBtns.addView(cp);
-        logBtns.addView(cl);
-        c4.addView(logBtns);
-        c4.addView(gap(8));
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lp2.leftMargin = dp(8);
+        cl.setLayoutParams(lp2);
+        row.addView(cp);
+        row.addView(cl);
+        c.addView(row);
+        c.addView(gap(8));
         logView = new TextView(this);
         logView.setTextColor(Color.parseColor("#8B949E"));
         logView.setTextSize(12);
         logView.setText("（空）");
-        c4.addView(logView);
+        c.addView(logView);
         return sc;
     }
 
@@ -445,9 +606,39 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 主页状态刷新：只更新主页那块状态，不覆盖各功能页的执行状态。 */
+    private void refresh() {
+        final String st;
+        if (connected && adb.isConnected()) {
+            st = "已连接 " + nz(carIp) + ":5555\n"
+                    + (isRear ? "设备类型：后排娱乐屏" : "设备类型：前排（中控/主驾）屏") + "\n"
+                    + "当前活跃空间：" + (activeUser >= 0 ? activeUser + " · " + spaceLabel(activeUser) : "未知") + "\n"
+                    + "可安装空间：" + spaceListText();
+        } else {
+            st = "未连接车机。\n请先把手机连上车机热点，再点「一键连接车机」。";
+        }
+        ui.post(new Runnable() {
+            public void run() {
+                if (statusView != null) statusView.setText(st);
+            }
+        });
+    }
+
     private void setStatus(final String s) {
         ui.post(new Runnable() {
-            public void run() { statusView.setText(s); }
+            public void run() {
+                if (statusView != null) statusView.setText(s);
+                if (installStatus != null) installStatus.setText(s);
+                if (manageStatus != null) manageStatus.setText(s);
+            }
+        });
+    }
+
+    /** 主页入口下方的摘要行（保留上次结果，方便不进去也知道情况）。 */
+    private void setSummary(final TextView tv, final String s) {
+        if (tv == null) return;
+        ui.post(new Runnable() {
+            public void run() { tv.setText(s); }
         });
     }
 
@@ -461,7 +652,11 @@ public class MainActivity extends Activity {
                 if (logBuf.length() > 0) logBuf.append("\n");
                 logBuf.append("[+").append((System.currentTimeMillis() - logT0) / 1000).append("s] ").append(s);
                 if (logBuf.length() > 12000) logBuf.delete(0, logBuf.length() - 10000);
-                logView.setText(logBuf.toString());
+                if (logView != null) logView.setText(logBuf.toString());
+                if (homeLogLine != null) {
+                    String last = s.indexOf('\n') > 0 ? s.substring(0, s.indexOf('\n')) : s;
+                    homeLogLine.setText("最近：" + last);
+                }
             }
         });
     }
@@ -557,54 +752,6 @@ public class MainActivity extends Activity {
                         renderSpaceChoices();
                     }
                 });
-            }
-        }).start();
-    }
-
-    /**
-     * 读车机 /data/misc/adb/adb_keys，与本机公钥比对 —— 一条命令就能判定"车机有没有记住我们"。
-     * 判定结果直接决定下一步：没记住 = 授权框里的「始终允许」没勾（或点了拒绝/仅本次）。
-     */
-    private void checkAuthKeys() {
-        if (!ensureConnected()) return;
-        setStatus("正在检查车机已授权公钥 …");
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    String mine = adb.publicKeyBase64();
-                    String dump = sh("cat /data/misc/adb/adb_keys 2>&1", 30000).trim();
-                    StringBuilder sb = new StringBuilder("车机 /data/misc/adb/adb_keys：\n");
-                    boolean found = false;
-                    int n = 0;
-                    if (dump.contains("Permission denied") || dump.contains("No such file")
-                            || dump.contains("not found")) {
-                        sb.append("（无法读取：").append(dump).append("）\n");
-                    } else if (dump.length() == 0) {
-                        sb.append("（文件为空 = 车机还没记住任何密钥）\n");
-                    } else {
-                        for (String line : dump.split("\n")) {
-                            String t = line.trim();
-                            if (t.length() == 0) continue;
-                            n++;
-                            String b64 = t.split(" ")[0];
-                            boolean hit = b64.equals(mine);
-                            if (hit) found = true;
-                            sb.append("· ").append(b64.substring(0, Math.min(16, b64.length()))).append("…")
-                                    .append(hit ? "  ← 本机密钥 ✅" : "").append("\n");
-                        }
-                        sb.append("共 ").append(n).append(" 把已授权密钥\n");
-                    }
-                    sb.append("本机公钥前 16 位：").append(mine.substring(0, Math.min(16, mine.length()))).append("…\n");
-                    sb.append("认证轨迹：").append(nz(adb.authTrace.toString())).append("\n");
-                    sb.append(found
-                            ? "结论：车机已记住本机密钥 —— 之后连接不该再弹框；若仍弹，请把这段发我。"
-                            : "结论：车机**没有**本机密钥记录 → 授权框里的「始终允许」没勾（或点成了拒绝/仅本次）。"
-                              + "下次弹框时务必勾上「始终允许」再点「允许」。");
-                    log(sb.toString());
-                    setStatus(found ? "车机已记住本机密钥 ✅" : "车机未记住本机密钥（请勾「始终允许」）");
-                } catch (Exception e) {
-                    log("检查失败：" + e.getMessage());
-                }
             }
         }).start();
     }
@@ -1067,6 +1214,7 @@ public class MainActivity extends Activity {
             }
 
             setStatus(label + " 安装失败");
+            setSummary(installSummary, "上次安装：" + label + " ❌ 失败（见日志）");
             String joined = allErr.length() > 0 ? allErr.toString() : String.valueOf(out);
             log("❌ 三种方式都没装上。车机最后返回：\n" + tailOf(out)
                     + "\n\n【各方式原因汇总】\n" + tailOf(joined)
@@ -1381,6 +1529,8 @@ public class MainActivity extends Activity {
                             renderSpaceChecks();
                             renderApps("");
                             setStatus("已读取 " + deviceUsers.size() + " 个空间、" + allPkgs.size() + " 个第三方应用");
+                            setSummary(manageSummary, "空间 " + deviceUsers.size() + " 个 · 第三方应用 "
+                                    + allPkgs.size() + " 个（可搜预置/残留包）" + (selectedPkg == null ? "" : " · 已选 " + selectedPkg));
                             log("勾选空间（可多选）+ 点选一个应用，然后点「授权」或「取消授权」。\n"
                                     + "空间原始信息：" + nz(rawUserList) + "\n"
                                     + "当前活跃空间：" + (activeUser >= 0 ? activeUser : "未知")
@@ -1657,6 +1807,8 @@ public class MainActivity extends Activity {
                         sb.append("诊断：无预置同名包、也无残留记录；各空间已清理并复核，可直接回卡片②重装。\n");
                     }
                     setStatus(left.length() == 0 ? "已彻底卸载：" + pkg : "仍有残留：" + pkg);
+                    setSummary(manageSummary, "上次操作：彻底卸载 " + pkg
+                            + (left.length() == 0 ? " ✅ 各空间已清" : " ⚠️ 仍有残留：" + left));
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         refreshLauncherQuiet(deviceUsers.get(i).intValue());
                     }
@@ -1699,6 +1851,8 @@ public class MainActivity extends Activity {
                     }
                 }
                 setStatus((grant ? "授权" : "取消授权") + "完成：" + pkg);
+                setSummary(manageSummary, "上次操作：" + (grant ? "授权" : "取消授权") + " " + pkg
+                        + " → 空间 " + uids);
                 // 这类车机的桌面列表有缓存：授权/卸载后不刷新，桌面可能看不到变化（实测需重启 launcher）
                 for (Integer u : uids) {
                     refreshLauncherQuiet(u.intValue());
