@@ -328,6 +328,14 @@ public class MainActivity extends Activity {
         pkgInput.setPadding(dp(12), dp(10), dp(12), dp(10));
         c3.addView(pkgInput);
         c3.addView(gap(8));
+        c3.addView(btn("诊断：该应用在各空间的安装状态", "#1F6FEB", new Runnable() {
+            public void run() { dumpUsers(); }
+        }));
+        c3.addView(gap(8));
+        c3.addView(btn("刷新主驾桌面（重启 launcher）", "#8957E5", new Runnable() {
+            public void run() { refreshLauncher(); }
+        }));
+        c3.addView(gap(8));
         c3.addView(btn("诊断 + 彻底卸载这个包名", "#8B1E1E", new Runnable() {
             public void run() {
                 String v = pkgInput.getText().toString().trim();
@@ -1470,6 +1478,98 @@ public class MainActivity extends Activity {
      * INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package xxx signatures do not match previously installed version。
      * 第 1 步 `pm uninstall <pkg>`（不带 --user）才是"对所有用户卸载"。
      */
+    /**
+     * 诊断：把某个包在**每个用户空间**里的状态打出来（installed/enabled/hidden/stopped/安装原因）。
+     * 用来区分"包真的没装"和"装了但桌面不显示"。
+     */
+    private void dumpUsers() {
+        if (!ensureConnected()) return;
+        final String pkg = currentPkg();
+        if (pkg.length() == 0) {
+            log("请先在应用列表里点选一个包，或在上面的输入框里填包名。");
+            return;
+        }
+        setStatus("正在诊断 " + pkg + " 的各空间状态 …");
+        new Thread(new Runnable() {
+            public void run() {
+                StringBuilder sb = new StringBuilder("【" + pkg + " 各空间安装状态】\n");
+                try {
+                    String all = sh("pm list packages -u " + pkg + " 2>/dev/null", 30000).trim();
+                    sb.append("· pm list packages -u：").append(all.length() == 0 ? "无记录" : all).append("\n");
+                    String full = sh("dumpsys package " + pkg + " 2>/dev/null", 60000);
+                    // 抓取每个 "User N:" 段的关键字段
+                    java.util.regex.Matcher m = java.util.regex.Pattern
+                            .compile("User (\\d+):([^\\n]*)\\n((?:\\s+[a-zA-Z]+=.*\\n)*)").matcher(full);
+                    int found = 0;
+                    while (m.find()) {
+                        found++;
+                        String uid = m.group(1);
+                        String head = m.group(2).trim();
+                        String body = m.group(3);
+                        String flags = "";
+                        for (String line : body.split("\\n")) {
+                            String t = line.trim();
+                            if (t.startsWith("installed=") || t.startsWith("enabled=") || t.startsWith("hidden=")
+                                    || t.startsWith("stopped=") || t.startsWith("suspended=")
+                                    || t.startsWith("installReason=") || t.startsWith("stopped=")) {
+                                flags += t + "  ";
+                            }
+                        }
+                        boolean pathOk = adb.shell("pm path --user " + uid + " " + pkg + " 2>/dev/null", 30000)
+                                .contains("package:");
+                        sb.append("· user ").append(uid).append("：")
+                                .append(pathOk ? "pm path 有 ✅" : "pm path 无 ❌")
+                                .append(head.length() == 0 ? "" : "  ").append(head).append("\n")
+                                .append("    ").append(flags.length() == 0 ? "（未读到字段）" : flags).append("\n");
+                    }
+                    if (found == 0) {
+                        sb.append("（dumpsys 里没有 User 段 —— 该包在车机上没有安装记录）\n");
+                    }
+                    sb.append("提示：installed=true 而桌面不显示 → 是桌面（launcher）显示/缓存问题，点「刷新主驾桌面」或重启车机；")
+                            .append("installed=false → 对该空间再点一次「授权到选中空间」。");
+                    log(sb.toString());
+                    setStatus("诊断完成，见日志");
+                } catch (Exception e) {
+                    log("诊断失败：" + nz(e.getMessage()));
+                }
+            }
+        }).start();
+    }
+
+    private String currentPkg() {
+        if (selectedPkg != null && selectedPkg.length() > 0) return selectedPkg;
+        if (pkgInput != null) return pkgInput.getText().toString().trim();
+        return "";
+    }
+
+    /**
+     * 刷新桌面：重启车机 launcher（这类车机"应用装上了但桌面不显示"最常见的原因就是 launcher 缓存）。
+     * 车机桌面是系统应用，force-stop 后系统会自动拉起；这里再主动 start 一次确保回来。
+     */
+    private void refreshLauncher() {
+        if (!ensureConnected()) return;
+        final int uid = chosenUser >= 0 ? chosenUser : 12;
+        setStatus("正在刷新主驾桌面 …");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    String pkgName = "com.flyme.auto.launcher";
+                    sh("am force-stop --user " + uid + " " + pkgName + " 2>&1", 30000);
+                    Thread.sleep(1500);
+                    String start = sh("am start --user " + uid + " -n " + pkgName
+                            + "/com.flyme.auto.launcher.ui.main.LauncherActivity 2>&1", 30000).trim();
+                    log("已重启桌面（user " + uid + "）：\n" + tailOf(start)
+                            + "\n如果桌面仍未出现应用，请**重启车机**一次（桌面列表会重建）；"
+                            + "同时用「诊断：该应用在各空间的安装状态」确认 installed=true。");
+                    setStatus("桌面已重启");
+                } catch (Exception e) {
+                    log("刷新桌面失败：" + nz(e.getMessage())
+                            + "\n可手动在车机上重启或重启车机。");
+                }
+            }
+        }).start();
+    }
+
     private void purgePackage(String explicit) {
         if (!ensureConnected()) return;
         final String pkg = (explicit != null && explicit.length() > 0) ? explicit
