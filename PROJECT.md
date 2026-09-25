@@ -84,8 +84,47 @@ pm path --user 0 com.desaysv.launcher     # 德赛西威 launcher = 后排屏桌
 - 区域：`1001` 中控 / `1002` 副驾 / `1003` 全屏
 - 查询顶层应用：`transact(4)` → `getTopPkgName(area)`，回退 AIDL 反射
 
+## v1.0.1（2026-09-25）：实机反馈三连修 + 桌面联测
+
+实机反馈三个问题，两个是协议层真 bug：
+
+### ① 每次连接都重弹车机授权框
+`ensureKey()` 原来**每次进程内现生成 RSA 密钥、不落盘** → 每次启动/连接都是新公钥，adbd 自然不认识 → 必然弹框（车机里记住的是旧公钥）。
+修：新增 `AdbClient.KeyProvider` 接口（`loadPrivate/loadPublic/save/onAuthRequested`），手机端用 SharedPreferences 存 PKCS#8/X.509；连接时先私钥签名（已授权就直接过），不被认可才发公钥。`onAuthRequested()` 在发公钥那一刻提示用户去车机屏点"允许"。日志额外打印密钥指纹（SHA256 前 8 字节）便于核对"密钥有没有变"。
+
+### ② 安装失败 `sync 失败: FAIL missing, in ID_SEND_V1` / `Software caused connection abort`
+根因（有 AOSP 源码为据，`packages/modules/adb/daemon/file_sync_service.cpp`）：
+
+```cpp
+static bool do_send_v1(int s, const std::string& spec, ...) {
+    // 'spec' is of the form "/some/path,0755". Break it up.
+    size_t comma = spec.find_last_of(',');
+    if (comma == std::string::npos) { SendSyncFail(s, "missing , in ID_SEND_V1"); return false; }
+```
+`file_sync_protocol.h` 亦注明：*"send_v1 sent the path in a buffer, followed by a comma and the mode as a string."*
+
+即 **SEND_V1 的 path 字段整串 = `"<路径>,<八进制权限>"`**（`handle_sync_command` 先读 `SyncRequest{id, path_length}`，再读 `path_length` 字节的 name，这个 name 就是 spec）。旧实现按 `path_length+path+uint32 mode` 发，没有逗号 → 直接 FAIL；另一路直接掐连接（就是那个 "connection abort"）。
+修：`spec = path + ",0" + Integer.toOctalString(mode & 0777)`（**前导 0 必须有**：adbd 用 `strtoul(s, NULL, 0)`，`644` 会被当十进制 644）。
+
+同时加固（都是这次联测逼出来的）：
+- **流 id 归属判定**（真 bug，已修）：`shell()` 里 `if (remote < 0) remote = m.arg0;` 没校验 `m.arg1 == local`，于是**上一条流（sync）滞后的 OKAY 会被当成本流的 OPEN-OKAY**，remote 拿到错 id，紧接着的收尾 CLSE 又被当成"本流关闭" → `shell()` 静默返回空串。所有流的 OKAY/CLSE 现在都按 `arg1 == local` 判归属；`push()`/`pushViaShell()` 结束加 `drainTrailing()` 排空收尾报文。
+- 分块上限取 adbd 通告的 maxdata 与 `SYNC_DATA_MAX(64KB)` 的较小值；等流控 ACK 期间先到的 sync 应答**入队**（原来会被静默丢，可能挂死）。
+- 推送失败自动回退 **shell 流通道**（`shell:cat > /tmp/xxx.apk`，与一键连接同一条已验证通道）。
+- 推送后核对车机侧文件大小（`stat -c %s` 兜底 `ls -l`），`pm install` 报错翻译成人话（签名冲突/存储不足/`-t` 自动重试 INSTALL_FAILED_TEST_ONLY 等），大包每 10MB 报进度。
+
+### ③ 授权空间管理不显示"空间号 ↔ 主驾/副驾/后排娱乐屏"
+新增 `spaceLabel(uid)`：`0 主驾(司机) / 10 访客 / 12 主驾·中控 / 13 副驾（识别 "<主空间>_clone" 克隆关系，按 LIGHTBOX 的"副驾=中控+1"先例）/ 100 后排娱乐屏 / 101 中控+副驾`。行标题形如 `13 · 副驾屏（12 主驾/中控空间的克隆） ✱当前活跃`，下方小字给**设备原始空间名**，上方加图例并声明"标签是推断、以实车为准"；每次加载刷新 `am get-current-user` / `pm list users`，并把原始信息 + `dumpsys activity` 的 display↔user 旁证打进日志（便于远程校准标签）。
+
+### 桌面联测工具（不随 APK 发布）
+`/tmp/adbtest/`：`mock_adbd.py` 按 AOSP 语义复刻 adbd（CNXN/AUTH 验签/sync SEND_V1 逗号解析/shell 流），`android/util/Base64.java` 是给桌面 JDK 的桩，`TestMain.java` 跑 7 项断言。用法见 `PROJECT.md` 下表；`AdbClient.DEBUG=true` 可打收发报文。
+
+踩过的 mock 坑（写同类测试时注意）：真 adbd 的 sync/shell **读的是被 adb 拆包后的 fd**，mock 必须自己解 WRTE 并逐包回 OKAY（`Stream` 类）；接受 OPEN 后必须先回 OKAY，否则客户端不会开始写 stdin；Python `int(s, 0)` **不接受** `"0644"` 前导 0（C 的 `strtoul(base 0)` 接受），要自己实现 `c_strtoul`；服务结束后客户端会回一个 CLSE，mock 不能当异常断连接（真 adbd 忽略）。
+
+联测结果：首次连接走公钥授权 ✅ / shell 通道 ✅ / sync 推送 200KB 逐字节一致 ✅ / shell 兜底 150KB 逐字节一致 ✅ / FAIL 原文透传 ✅ / sync 之后 shell 仍正常 ✅ / 复用持久化密钥不再弹框 ✅。
+
 ## 待办
 
+- [ ] 实机复验 v1.0.1：二次连接不再弹授权框、装机成功、空间标签正确
 - [ ] 大包推送性能：`WRTE` 流控改为窗口化
 - [ ] 后排空间命名按实机校准（不同固件的空间编号可能不同）
 - [ ] 装机后校验：`pm path --user N <pkg>` 确认落点

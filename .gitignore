@@ -7,3 +7,8 @@ build/keystore/
 *.apk
 *.hap
 *.idsig
+
+# 联测产物
+tests/out/
+tests/keys.txt
+tests/*.log

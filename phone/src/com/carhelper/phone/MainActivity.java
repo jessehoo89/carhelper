@@ -12,6 +12,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -24,6 +25,7 @@ import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,6 +47,11 @@ public class MainActivity extends Activity {
     private static final String PREFS = "carhelper";
     private static final String K_AGREED = "risk_agreed_v1";
 
+    // ADB RSA 密钥持久化：密钥不变，车机才不会每次连接都重弹授权框
+    private static final String PREFS_KEYS = "carhelper_adbkey";
+    private static final String K_PK = "pkcs8";
+    private static final String K_PUB = "x509";
+
     // 领克/吉利多屏空间（见 car-hu-api-research/findings/07）
     private static final int U_CENTER = 12;   // 中控/主驾屏
     private static final int U_PASSENGER = 13; // 副驾屏（= 中控 id + 1）
@@ -60,19 +67,44 @@ public class MainActivity extends Activity {
     private EditText appFilter;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private final AdbClient adb = new AdbClient();
+    /** ADB 密钥存取（SharedPreferences）：一次授权，长期免弹框。 */
+    private final AdbClient.KeyProvider keys = new AdbClient.KeyProvider() {
+        public byte[] loadPrivate() { return prefsBytes(K_PK); }
+
+        public byte[] loadPublic() { return prefsBytes(K_PUB); }
+
+        public void save(byte[] priv, byte[] pub) {
+            getSharedPreferences(PREFS_KEYS, MODE_PRIVATE).edit()
+                    .putString(K_PK, Base64.encodeToString(priv, Base64.NO_WRAP))
+                    .putString(K_PUB, Base64.encodeToString(pub, Base64.NO_WRAP))
+                    .apply();
+        }
+
+        public void onAuthRequested() {
+            log("⚠️ 车机屏幕上已弹出「允许调试」授权框 —— 请在车机屏上点「允许」。\n"
+                    + "（本机密钥已保存，授权成功后以后连接不再弹框；若在车机里撤销过调试授权，则会再弹一次。）");
+        }
+    };
+
+    private final AdbClient adb = new AdbClient(keys);
     private CarFinder.Wifi wifi;
     private String carIp;
     private boolean isRear;
     private boolean connected;
     private String selectedPkg;
     private int chosenUser = -1;
+    /** 车机当前活跃（前台）用户空间号，-1 未知 */
+    private int activeUser = -1;
+    /** 车机原始用户列表（pm list users 原文），打印到日志便于核对标签 */
+    private String rawUserList = "";
+    /** 本次连接是否向车机提交了公钥（即是否触发了授权框） */
+    private boolean authAsked = false;
 
     private final List<Integer> deviceUsers = new ArrayList<Integer>();
     private final List<String> deviceUserNames = new ArrayList<String>();
     private final List<String> allPkgs = new ArrayList<String>();
     private final List<Integer> pickedSpaces = new ArrayList<Integer>();
-    private final List<int[]> targets = new ArrayList<int[]>(); // {userId, 名称资源索引}
+    private final List<Integer> targets = new ArrayList<Integer>(); // 可选的安装目标用户空间
 
     // ================================================================== 生命周期
 
@@ -93,7 +125,8 @@ public class MainActivity extends Activity {
 
     private void boot() {
         setStatus("就绪");
-        log("请确保：① 手机已连车机热点（Lynk&Co）② 车辆处于 P 挡、车机屏已唤醒。\n然后点「一键连接车机」。");
+        log("请确保：① 手机已连车机热点（Lynk&Co）② 车辆处于 P 挡、车机屏已唤醒。\n然后点「一键连接车机」。\n"
+                + "首次连接：车机屏会弹「允许调试」授权框，点「允许」即可（本机会记住密钥，之后连接不再弹）。");
     }
 
     /** 首次启动的风险告知（同意后方可使用）。 */
@@ -309,16 +342,44 @@ public class MainActivity extends Activity {
         });
     }
 
+    private final StringBuilder logBuf = new StringBuilder();
+
+    /** 追加一条日志（保留最近若干行，便于回看整条链路）。 */
     private void log(final String s) {
         ui.post(new Runnable() {
-            public void run() { logView.setText(s); }
+            public void run() {
+                if (logBuf.length() > 0) logBuf.append("\n");
+                logBuf.append(s);
+                if (logBuf.length() > 6000) logBuf.delete(0, logBuf.length() - 5000);
+                logView.setText(logBuf.toString());
+            }
         });
+    }
+
+    private void clearLog() {
+        ui.post(new Runnable() {
+            public void run() {
+                logBuf.setLength(0);
+                logView.setText("（空）");
+            }
+        });
+    }
+
+    private byte[] prefsBytes(String k) {
+        String v = getSharedPreferences(PREFS_KEYS, MODE_PRIVATE).getString(k, null);
+        if (v == null) return null;
+        try {
+            return Base64.decode(v, Base64.NO_WRAP);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // ================================================================== ① 一键连接
 
     private void oneClickConnect() {
         setStatus("正在连接车机 …");
+        clearLog();
         log("步骤 1/4 检测 WiFi 网络 …");
         new Thread(new Runnable() {
             public void run() {
@@ -347,9 +408,9 @@ public class MainActivity extends Activity {
                 String err = null;
                 for (String ip : hits) {
                     try {
-                        stepLog("步骤 3/4 连接 " + ip + ":5555 …");
+                        stepLog("步骤 3/4 连接 " + ip + ":5555 …（首次连接车机屏会弹授权框，点「允许」即可）");
                         adb.close();
-                        adb.connect(ip, 5555, 6000, 60000);
+                        authAsked = adb.connect(ip, 5555, 6000, 60000);
                         carIp = ip;
                         connected = true;
                         err = null;
@@ -365,6 +426,8 @@ public class MainActivity extends Activity {
                             + "（建议勾选“始终允许”），然后重新点「一键连接车机」。");
                     return;
                 }
+                stepLog("步骤 3/4 ✅ 已连接（本机 ADB 密钥指纹 " + adb.keyFingerprint() + "）"
+                        + (authAsked ? " — 本次已向车机提交公钥，若车机屏弹框请点「允许」" : " — 密钥已被车机认可，无需再授权"));
 
                 // 4) 识别设备与可用空间
                 stepLog("步骤 4/4 识别设备类型与可用屏幕空间 …");
@@ -409,13 +472,45 @@ public class MainActivity extends Activity {
                         + "printf ';PRODUCT=';getprop ro.product.name;"
                         + "printf ';DEVICE=';getprop ro.product.device;"
                         + "printf ';USER=';am get-current-user;"
-                        + "printf ';USERS=';pm list users | tr '\\n' ' ';"
+                        + "printf ';USERS=';pm list users | tr '\\n' '|';"
                         + "printf ';REAR=';pm path --user 0 com.desaysv.launcher 2>/dev/null | head -1");
 
         String rearSeg = seg(out, "REAR=");
         isRear = rearSeg.contains("package:");
 
-        String usersSeg = seg(out, "USERS=");
+        rawUserList = seg(out, "USERS=").trim();
+        parseUsers(rawUserList);
+        activeUser = parseIntSafe(seg(out, "USER="));
+
+        String cur = String.valueOf(activeUser >= 0 ? activeUser : 0);
+
+        // 目标空间：前排 = 中控/主驾 + 副驾；后排 = 左(0) + 右(10)
+        targets.clear();
+        if (isRear) {
+            // 后排娱乐屏：空间号因车型/固件而异（100 表示"后排"，部分固件下真实 user 需动态解析）
+            // → 以实机检测为准：优先 100 / 101，其次 0 / 10，最后列出全部真实空间
+            int[] pref = {100, 101, U_REAR_A, U_REAR_B};
+            for (int pi = 0; pi < pref.length; pi++) addTargetIfExists(pref[pi]);
+            if (targets.isEmpty()) {
+                for (int i = 0; i < deviceUsers.size(); i++) targets.add(Integer.valueOf(deviceUsers.get(i)));
+            }
+        } else {
+            addTargetIfExists(U_CENTER);
+            addTargetIfExists(U_PASSENGER);
+        }
+        if (targets.isEmpty()) {
+            // 兜底：用当前活跃空间
+            targets.add(Integer.valueOf(activeUser >= 0 ? activeUser : 0));
+        }
+        chosenUser = targets.get(0).intValue();
+        log("车机：" + nz(seg(out, "MODEL=")) + "（序列号 " + nz(seg(out, "SERIAL=")) + "，"
+                + (isRear ? "后排娱乐屏" : "前排（中控/主驾）屏") + "）\n"
+                + "用户空间原始信息：" + nz(rawUserList) + "\n"
+                + "当前活跃空间：" + (activeUser >= 0 ? activeUser : "未知"));
+    }
+
+    /** 解析 `pm list users` 输出（UserInfo{12:Co客9ZJ57K:...}）。 */
+    private void parseUsers(String usersSeg) {
         deviceUsers.clear();
         deviceUserNames.clear();
         Matcher m = Pattern.compile("UserInfo\\{(\\d+):([^:}]*)[:}]").matcher(usersSeg);
@@ -423,63 +518,33 @@ public class MainActivity extends Activity {
             deviceUsers.add(Integer.valueOf(Integer.parseInt(m.group(1))));
             deviceUserNames.add(m.group(1) + " · " + m.group(2));
         }
-
-        String curSeg = seg(out, "USER=").trim();
-        int cur = -1;
-        try {
-            cur = Integer.parseInt(curSeg.replaceAll("[^0-9]", ""));
-        } catch (Exception ignored) {
-        }
-
-        // 目标空间：前排 = 中控(12) + 副驾(13)；后排 = 左(0) + 右(10)
-        targets.clear();
-        if (isRear) {
-            // 后排娱乐屏：空间号因车型/固件而异（100 表示"后排"，部分固件下真实 user 需动态解析）
-            // → 以实机检测为准：优先 100 / 101，其次 0 / 10，最后列出全部真实空间
-            int[] pref = {100, 101, U_REAR_A, U_REAR_B};
-            for (int pi = 0; pi < pref.length; pi++) addTargetIfExists(pref[pi], null);
-            if (targets.isEmpty()) {
-                for (int i = 0; i < deviceUsers.size(); i++) targets.add(new int[]{deviceUsers.get(i), 0});
-            }
-        } else {
-            addTargetIfExists(U_CENTER, "主驾屏（中控）");
-            addTargetIfExists(U_PASSENGER, "副驾屏");
-        }
-        if (targets.isEmpty()) {
-            // 兜底：用当前活跃空间
-            targets.add(new int[]{cur >= 0 ? cur : 0, 0});
-        }
-        chosenUser = targets.get(0)[0];
     }
 
-    private void addTargetIfExists(int uid, String name) {
+    private void addTargetIfExists(int uid) {
         if (deviceUsers.contains(Integer.valueOf(uid))) {
-            targets.add(new int[]{uid, 0});
+            targets.add(Integer.valueOf(uid));
         }
     }
 
     private void renderSpaceChoices() {
         spaceGroup.removeAllViews();
-        // 重新按顺序生成名称（probeDevice 里只存了 uid）
-        List<String> names = new ArrayList<String>();
-        for (int[] t : targets) names.add(spaceName(t[0]));
-        if (isRear) {
-            spaceHint.setText("当前连接：后排娱乐屏热点\n可安装到：后排娱乐屏（用户空间 100）");
-        } else {
-            spaceHint.setText("当前连接：前排热点\n可安装到：中控（用户空间 12）、副驾（用户空间 13）");
-        }
+        String head = isRear ? "当前连接：后排娱乐屏热点" : "当前连接：前排（中控/主驾）热点";
+        if (carIp != null) head += "（" + carIp + "）";
+        spaceHint.setText(head + "\n可安装到：" + spaceListText()
+                + (activeUser >= 0 ? "\n车机当前活跃空间：" + activeUser + " · " + spaceLabel(activeUser) : ""));
         for (int i = 0; i < targets.size(); i++) {
+            final int uid = targets.get(i).intValue();
             RadioButton rb = new RadioButton(this);
-            rb.setText(names.get(i) + "（用户空间 " + targets.get(i)[0] + "）");
+            rb.setText(spaceRowTitle(uid));
             rb.setTextColor(Color.WHITE);
             rb.setTextSize(14);
             rb.setId(2000 + i);
-            rb.setTag(Integer.valueOf(targets.get(i)[0]));
-            if (i == 0) rb.setChecked(true);
+            rb.setTag(Integer.valueOf(uid));
+            if (uid == chosenUser) rb.setChecked(true);
             rb.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
                     chosenUser = ((Integer) v.getTag()).intValue();
-                    setStatus("已选择安装位置：用户空间 " + chosenUser);
+                    setStatus("已选择安装位置：" + spaceRowTitle(chosenUser));
                 }
             });
             spaceGroup.addView(rb);
@@ -489,11 +554,73 @@ public class MainActivity extends Activity {
         note.setTextColor(Color.parseColor("#586069"));
         note.setTextSize(11);
         note.setPadding(0, dp(4), 0, 0);
-        StringBuilder sb = new StringBuilder("已自动筛除本设备上不可用的空间（本机用户空间：");
+        StringBuilder sb = new StringBuilder("已列出本设备上真实存在的空间（原始信息：" );
         sb.append(deviceUserNames.isEmpty() ? "未读到" : join(deviceUserNames));
         sb.append("）");
         note.setText(sb.toString());
         spaceGroup.addView(note);
+    }
+
+    /** 「12 · 主驾/中控屏」形式的空间标题。 */
+    private String spaceRowTitle(int uid) {
+        return uid + " · " + spaceLabel(uid) + (uid == activeUser ? "  ✱当前活跃" : "");
+    }
+
+    private String spaceListText() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < targets.size(); i++) {
+            int uid = targets.get(i).intValue();
+            if (sb.length() > 0) sb.append("、");
+            sb.append(uid).append(" · ").append(spaceLabel(uid));
+        }
+        return sb.length() == 0 ? "（未识别到可用空间）" : sb.toString();
+    }
+
+    /** 取车机上该空间的原始名（Co客9ZJ57K / 12_clone / GUEST …）。 */
+    private String rawNameOf(int uid) {
+        for (int i = 0; i < deviceUsers.size(); i++) {
+            if (deviceUsers.get(i).intValue() == uid) {
+                String s = deviceUserNames.get(i);
+                int p = s.indexOf(" · ");
+                return p < 0 ? s : s.substring(p + 3);
+            }
+        }
+        return "";
+    }
+
+    /**
+     * 用户空间号 → 屏幕名（界面提示用）。
+     *
+     * 依据：
+     *  · 领克/吉利多屏约定（LIGHTBOX 先例）：12 主驾/中控、13 副驾、100 后排娱乐屏、101 中控+副驾
+     *  · 0 = 司机基础空间、10 = 访客（GUEST）
+     *  · 副驾/移动空间常表现为「主空间的克隆」，车机里名为 "<主空间>_clone"（如 12_clone = 13）
+     *  · 当前活跃空间（am get-current-user）视为主驾/中控屏
+     * 标签属推断，界面同时显示设备原始空间名，便于你自行判断。
+     */
+    private String spaceLabel(int uid) {
+        String raw = rawNameOf(uid);
+        boolean clone = raw.endsWith("_clone");
+        int base = -1;
+        if (clone) {
+            try {
+                base = Integer.parseInt(raw.substring(0, raw.indexOf('_')));
+            } catch (Exception ignored) {
+            }
+        }
+        if (uid == 100) return "后排娱乐屏";
+        if (uid == 101) return "中控 + 副驾";
+        if (uid == 0) return "主驾（司机基础空间）";
+        if (uid == 10) return "访客空间（GUEST）";
+        if (clone) {
+            if (base == 12 || (base == activeUser && activeUser >= 10)) {
+                return "副驾屏（" + base + " 主驾/中控空间的克隆）";
+            }
+            if (base == 10) return "访客的克隆空间（移动空间）";
+            return base + " 的克隆空间";
+        }
+        if (uid == 12 || uid == activeUser) return "主驾 / 中控屏";
+        return "用户空间 " + uid;
     }
 
     // ================================================================== ② 安装
@@ -518,8 +645,11 @@ public class MainActivity extends Activity {
             new Thread(new Runnable() {
                 public void run() {
                     try {
-                        InputStream is = getContentResolver().openInputStream(uri);
-                        install(is, "所选 APK", false);
+                        install(new StreamFactory() {
+                            public InputStream open() throws IOException {
+                                return getContentResolver().openInputStream(uri);
+                            }
+                        }, "所选 APK", false, sizeOf(uri));
                     } catch (Exception e) {
                         log("读取所选文件失败：" + e.getMessage());
                     }
@@ -533,8 +663,11 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    InputStream is = getAssets().open("carhelper-fullscreen.apk");
-                    install(is, "全屏工具", true);
+                    install(new StreamFactory() {
+                        public InputStream open() throws IOException {
+                            return getAssets().open("carhelper-fullscreen.apk");
+                        }
+                    }, "全屏工具", true, assetSize("carhelper-fullscreen.apk"));
                 } catch (Exception e) {
                     log("读取内置全屏工具失败：" + e.getMessage());
                 }
@@ -542,34 +675,157 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private void install(InputStream src, String label, boolean launch) {
+    /** 重新打开待推送数据源（sync 失败回退 shell 时需要第二条独立流）。 */
+    private interface StreamFactory {
+        InputStream open() throws IOException;
+    }
+
+    private void install(StreamFactory sf, String label, boolean launch, long expectSize) {
+        String tmp = "/data/local/tmp/carhelper-" + System.currentTimeMillis() + ".apk";
         try {
-            int uid = chosenUser >= 0 ? chosenUser : 0;
-            setStatus("正在推送 " + label + " …");
-            log("目标用户空间：" + uid + "\n开始推送（大包需 30~90 秒）…");
-            String tmp = "/data/local/tmp/carhelper-" + System.currentTimeMillis() + ".apk";
-            adb.push(src, tmp, 0644);
-            setStatus("正在安装 " + label + " …");
-            log("推送完成，执行 pm install --user " + uid + " …");
-            String out = adb.shell("pm install -r --user " + uid + " " + tmp);
-            adb.shell("rm -f " + tmp);
-            if (out.contains("Success")) {
-                setStatus(label + " 安装成功（用户空间 " + uid + "）");
-                String extra = "";
-                if (launch) {
-                    String r = adb.shell("am start --user " + uid
-                            + " -n com.carhelper.fullscreen/com.carhelper.fullscreen.MainActivity");
-                    extra = "\n已尝试在车机上拉起全屏工具。";
+            final int uid = chosenUser >= 0 ? chosenUser : 0;
+            setStatus("正在推送 " + label + " → 空间 " + uid + " …");
+            log("目标空间：" + spaceRowTitle(uid) + "\n开始推送 APK 到车机 " + tmp + " …");
+
+            long pushed;
+            final long[] lastLog = new long[]{0};
+            AdbClient.Progress prog = new AdbClient.Progress() {
+                public void onBytes(long n) {
+                    if (n - lastLog[0] >= 10 * 1024 * 1024) {
+                        lastLog[0] = n;
+                        log("已推送 " + (n / 1048576) + " MB …");
+                    }
                 }
-                log("✅ 安装成功（用户空间 " + uid + "）" + extra);
+            };
+
+            InputStream in = sf.open();
+            try {
+                pushed = adb.push(in, tmp, 0644, prog);
+            } catch (IOException e) {
+                log("sync 推送失败：" + e.getMessage() + "\n→ 改用备用通道（shell 流）重新推送 …");
+                try {
+                    in.close();
+                } catch (IOException ignored) {
+                }
+                InputStream in2 = sf.open();
+                try {
+                    pushed = adb.pushViaShell(in2, tmp, prog);
+                } finally {
+                    try {
+                        in2.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            } finally {
+                try {
+                    in.close();
+                } catch (IOException ignored) {
+                }
+            }
+
+            // 落到车机上的文件大小核对（防半截文件导致 pm install 解析失败）
+            String sizeStr = adb.shell("toybox stat -c %s " + tmp + " 2>/dev/null || ls -l " + tmp).trim();
+            long onDevice = firstNumber(sizeStr);
+            log("推送完成：" + pushed + " 字节；车机侧 " + (onDevice >= 0 ? onDevice + " 字节" : sizeStr));
+            if (expectSize > 0 && pushed != expectSize) {
+                log("⚠️ 源文件 " + expectSize + " 字节，实际推送 " + pushed + " 字节（可能被截断或源文件变化）。");
+            }
+            if (onDevice >= 0 && onDevice != pushed) {
+                log("⚠️ 文件大小与推送量不一致，可能被截断（请重试；若反复如此请把日志发我）。");
+            }
+
+            setStatus("正在安装 " + label + " → 空间 " + uid + " …");
+            log("执行 pm install -r --user " + uid + " …");
+            String out = adb.shell("pm install -r --user " + uid + " " + tmp, 300000);
+            if (out.contains("INSTALL_FAILED_TEST_ONLY")) {
+                log("该 APK 带 testOnly 标记，改用 -t 重试 …");
+                out = adb.shell("pm install -r -t --user " + uid + " " + tmp, 300000);
+            }
+            adb.shell("rm -f " + tmp);
+            String tail = out.trim();
+            if (tail.length() > 600) tail = tail.substring(tail.length() - 600);
+            if (out.contains("Success")) {
+                if (launch) {
+                    adb.shell("am start --user " + uid
+                            + " -n com.carhelper.fullscreen/com.carhelper.fullscreen.MainActivity");
+                    tail += "\n已尝试在车机上拉起全屏工具。";
+                }
+                setStatus(label + " 安装成功（空间 " + uid + " · " + spaceLabel(uid) + "）");
+                log("✅ 安装成功：" + spaceRowTitle(uid) + "\n" + tail
+                        + "\n提示：车机桌面若没出现图标，多半是装到了非当前活跃空间；"
+                        + "可换 " + (activeUser >= 0 ? activeUser : 12) + " 再装一次。");
             } else {
                 setStatus(label + " 安装失败");
-                log("安装失败，车机返回：\n" + out.trim());
+                log("❌ 安装失败：" + spaceRowTitle(uid) + "\n车机返回：\n" + tail + "\n"
+                        + installHint(out));
             }
         } catch (Exception e) {
+            try {
+                adb.shell("rm -f " + tmp);
+            } catch (Exception ignored) {
+            }
             setStatus("安装异常");
-            log("安装异常：" + e.getMessage());
+            String m = String.valueOf(e.getMessage());
+            if (e instanceof java.io.InterruptedIOException || m.contains("timed out")
+                    || m.contains("SocketTimeout")) {
+                log("安装超时：手机与车机之间链路中断或被限时。\n请确认手机仍连着车机热点、离车近一些，再重试。");
+            } else {
+                log("安装异常：" + m + "\n（若是连接被中断，请重新点「一键连接车机」——密钥已保存，不会再弹授权框。）");
+            }
         }
+    }
+
+    /** 常见 pm install 报错 → 人话建议。 */
+    private static String installHint(String out) {
+        if (out.contains("INSTALL_FAILED_ALREADY_EXISTS"))
+            return "建议：车机已存在同名包但签名不同 → 先「从选中空间取消授权」（卸载）再装。";
+        if (out.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE"))
+            return "建议：签名冲突，需先卸载车机上的旧版再装。";
+        if (out.contains("INSTALL_FAILED_VERSION_DOWNGRADE"))
+            return "建议：车机上是更高版本，先卸载旧版或用 -d 降级安装。";
+        if (out.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE"))
+            return "建议：车机存储空间不足，先清理。";
+        if (out.contains("INSTALL_FAILED_VERIFICATION_FAILURE"))
+            return "建议：被车机安装校验拦截，需要改包名重打包后再装。";
+        if (out.contains("INSTALL_PARSE_FAILED"))
+            return "建议：APK 解析失败（文件损坏/不完整），请确认推送字节数一致后重试。";
+        if (out.contains("INSTALL_FAILED_USER_RESTRICTED"))
+            return "建议：车机策略限制了安装来源。";
+        return "建议：把上面这段原文发我，我按错误码定位。";
+    }
+
+    private long sizeOf(Uri uri) {
+        android.database.Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, null, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int i = c.getColumnIndex(android.provider.OpenableColumns.SIZE);
+                if (i >= 0 && !c.isNull(i)) return c.getLong(i);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return -1;
+    }
+
+    private long assetSize(String name) {
+        try {
+            return getAssets().openFd(name).getLength();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static long firstNumber(String s) {
+        Matcher m = Pattern.compile("(\\d{2,})").matcher(s);
+        while (m.find()) {
+            try {
+                return Long.parseLong(m.group(1));
+            } catch (Exception ignored) {
+            }
+        }
+        return -1;
     }
 
     // ================================================================== ③ 授权管理
@@ -580,6 +836,14 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try {
+                    // 1) 刷新用户空间与活跃空间（活跃空间可能被车主切换过）
+                    String info = adb.shell("printf 'USER=';am get-current-user;"
+                            + "printf ';USERS=';pm list users | tr '\\n' '|'");
+                    activeUser = parseIntSafe(seg(info, "USER="));
+                    rawUserList = seg(info, "USERS=").trim();
+                    parseUsers(rawUserList);
+
+                    // 2) 第三方应用
                     String pkgs = adb.shell("pm list packages -3");
                     allPkgs.clear();
                     for (String line : pkgs.split("\n")) {
@@ -587,12 +851,26 @@ public class MainActivity extends Activity {
                         if (s.startsWith("package:")) allPkgs.add(s.substring(8).trim());
                     }
                     Collections.sort(allPkgs);
+
+                    // 3) 屏幕归属旁证（display ↔ user，仅打到日志里，用于核对/校正标签）
+                    String evidence = "";
+                    try {
+                        evidence = adb.shell("dumpsys activity activities 2>/dev/null "
+                                + "| grep -E 'Display #|U=[0-9]+' | head -n 24 | tr '\\n' '|'", 25000).trim();
+                        if (evidence.length() > 700) evidence = evidence.substring(0, 700) + " …";
+                    } catch (Exception ignored) {
+                    }
+
+                    final String ev = evidence;
                     ui.post(new Runnable() {
                         public void run() {
                             renderSpaceChecks();
                             renderApps("");
                             setStatus("已读取 " + deviceUsers.size() + " 个空间、" + allPkgs.size() + " 个第三方应用");
-                            log("勾选空间（可多选）+ 点选一个应用，然后点「授权」或「取消授权」。");
+                            log("勾选空间（可多选）+ 点选一个应用，然后点「授权」或「取消授权」。\n"
+                                    + "空间原始信息：" + nz(rawUserList) + "\n"
+                                    + "当前活跃空间：" + (activeUser >= 0 ? activeUser : "未知")
+                                    + (ev.length() > 0 ? "\n屏幕归属旁证（display ↔ user）：" + ev : ""));
                         }
                     });
                 } catch (Exception e) {
@@ -606,10 +884,20 @@ public class MainActivity extends Activity {
     private void renderSpaceChecks() {
         spaceBox.removeAllViews();
         pickedSpaces.clear();
+
+        TextView legend = new TextView(this);
+        legend.setTextColor(Color.parseColor("#7A8894"));
+        legend.setTextSize(11);
+        legend.setText("空间对照（领克/吉利多屏约定）：0 主驾·司机 · 10 访客 · 12 主驾/中控 · 13 副驾 · "
+                + "100 后排娱乐屏 · 101 中控+副驾；名字带 _clone 的表示克隆空间（副驾/移动空间常表现为主空间的克隆）；"
+                + "✱ = 车机当前活跃空间。\n标签是按设备信息推断的，下面是每行的设备原始空间名，以实车为准。");
+        legend.setPadding(0, 0, 0, dp(8));
+        spaceBox.addView(legend);
+
         for (int i = 0; i < deviceUsers.size(); i++) {
-            final int uid = deviceUsers.get(i);
+            final int uid = deviceUsers.get(i).intValue();
             CheckBox cb = new CheckBox(this);
-            cb.setText(deviceUserNames.get(i));
+            cb.setText(spaceRowTitle(uid));
             cb.setTextColor(Color.WHITE);
             cb.setTextSize(14);
             cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
@@ -622,6 +910,15 @@ public class MainActivity extends Activity {
                 }
             });
             spaceBox.addView(cb);
+
+            String raw = rawNameOf(uid);
+            TextView sub = new TextView(this);
+            sub.setText("设备空间名：" + (raw.length() == 0 ? "（未读到）" : raw)
+                    + (uid == activeUser ? "　（车机正在使用的空间）" : ""));
+            sub.setTextColor(Color.parseColor("#586069"));
+            sub.setTextSize(11);
+            sub.setPadding(dp(34), 0, 0, dp(6));
+            spaceBox.addView(sub);
         }
     }
 
@@ -674,10 +971,11 @@ public class MainActivity extends Activity {
                             ? ("pm install-existing --user " + uid + " " + pkg)
                             : ("pm uninstall --user " + uid + " " + pkg);
                     try {
-                        sb.append("user ").append(uid).append(" → ")
+                        sb.append(uid).append(" · ").append(spaceLabel(uid)).append(" → ")
                                 .append(adb.shell(cmd).trim()).append("\n");
                     } catch (Exception e) {
-                        sb.append("user ").append(uid).append(" → 异常: ").append(e.getMessage()).append("\n");
+                        sb.append(uid).append(" · ").append(spaceLabel(uid))
+                                .append(" → 异常: ").append(e.getMessage()).append("\n");
                     }
                 }
                 setStatus((grant ? "授权" : "取消授权") + "完成：" + pkg);
@@ -688,17 +986,12 @@ public class MainActivity extends Activity {
 
     // ================================================================== 工具
 
-    /**
-     * 用户空间号 → 实际屏幕名。
-     * 车机多屏系统的用户空间编号约定：
-     *   12 → 中控   13 → 副驾   100 → 后排娱乐屏   101 → 中控和副驾   其他 → user N
-     */
-    static String spaceName(int uid) {
-        if (uid == 12) return "中控";
-        if (uid == 13) return "副驾";
-        if (uid == 100) return "后排娱乐屏";
-        if (uid == 101) return "中控和副驾";
-        return "user " + uid;
+    private static int parseIntSafe(String s) {
+        try {
+            return Integer.parseInt(s.replaceAll("[^0-9]", ""));
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private boolean ensureConnected() {

@@ -94,6 +94,19 @@ cd ../..
 - 24 字节消息头（小端）：`cmd / arg0 / arg1 / data_length / crc32 / magic(=cmd ^ 0xFFFFFFFF)`
 - 握手 `CNXN`；认证 `AUTH`（`TOKEN` → `SIGNATURE`，必要时发 `RSAPUBLICKEY` 触发车机屏授权）
 - 流操作：`OPEN` / `WRTE` / `OKAY` / `CLSE`，支持 `shell:` 执行命令与 `sync:` 推送文件
+- **密钥持久化**：RSA 密钥由 `KeyProvider` 落盘（手机端存 SharedPreferences）。密钥一变，车机就会重新弹授权框，所以**必须**持久化——一次授权长期免弹。
+- **推送用 `SEND_V1` 协议，载荷格式为 `<路径>,<八进制权限>`**（例 `/data/local/tmp/a.apk,0644`），不是"长度前缀路径 + 二进制 mode"。权限串**必须带前导 `0`**：adbd 用 `strtoul(s, NULL, 0)` 解析，`644` 会被当成十进制。格式写错时 adbd 会回 `FAIL missing , in ID_SEND_V1` 或直接断连接。
+- 单块上限取 adbd 通告的 `maxdata` 与 `SYNC_DATA_MAX`(64KB) 的较小值
+- 所有流的 `OKAY`/`CLSE` 都按 `arg1 == 本端 local id` 判归属——上一条流（如同步推送）滞后的报文不能被下一条流误认，否则 `shell()` 会静默返回空
+- `sync` 推送失败会自动回退到 shell 流通道（`cat > 目标路径`）
+
+### 测试
+
+```bash
+./tests/run.sh      # 桌面联测：用 mock_adbd.py 验证客户端协议实现
+```
+
+`tests/mock_adbd.py` 按 AOSP `packages/modules/adb` 的语义复刻了一个 adbd（CNXN/AUTH 验签/`SEND_V1` 逗号解析/shell 流/流控），`tests/TestMain.java` 跑 7 项断言：首次公钥授权、shell 通道、200KB 同步推送逐字节一致、150KB shell 兜底推送一致、`FAIL` 原文透传、跨流隔离、复用密钥不再弹框。`AdbClient.DEBUG = true` 可打印收发报文。
 
 ### 屏幕空间编号
 
