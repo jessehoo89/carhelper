@@ -65,6 +65,7 @@ public class MainActivity extends Activity {
     private LinearLayout spaceBox;
     private LinearLayout appBox;
     private EditText appFilter;
+    private EditText pkgInput;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     /** ADB 密钥存取（SharedPreferences）：一次授权，长期免弹框。 */
@@ -297,7 +298,29 @@ public class MainActivity extends Activity {
         }));
         c3.addView(gap(8));
         c3.addView(btn("彻底卸载（所有空间，清残留）", "#8B1E1E", new Runnable() {
-            public void run() { purgePackage(); }
+            public void run() { purgePackage(null); }
+        }));
+        c3.addView(gap(8));
+        TextView pt = new TextView(this);
+        pt.setText("列表里搜不到时，直接输包名（如 com.sumsg.musichub）");
+        pt.setTextColor(Color.parseColor("#8B949E"));
+        pt.setTextSize(12);
+        c3.addView(pt);
+        pkgInput = new EditText(this);
+        pkgInput.setHint("包名，如 com.sumsg.musichub");
+        pkgInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        pkgInput.setTextColor(Color.WHITE);
+        pkgInput.setHintTextColor(Color.parseColor("#586069"));
+        pkgInput.setBackground(bg("#0F1418", 10));
+        pkgInput.setPadding(dp(12), dp(10), dp(12), dp(10));
+        c3.addView(pkgInput);
+        c3.addView(gap(8));
+        c3.addView(btn("诊断 + 彻底卸载这个包名", "#8B1E1E", new Runnable() {
+            public void run() {
+                String v = pkgInput.getText().toString().trim();
+                if (v.length() == 0) { log("请先输入包名。"); return; }
+                purgePackage(v);
+            }
         }));
 
         // ---------------- 卡片 ④ 日志 ----------------
@@ -1186,7 +1209,7 @@ public class MainActivity extends Activity {
                     for (int i = 0; i < deviceUsers.size(); i++) {
                         int uid = deviceUsers.get(i).intValue();
                         // 全部包（含系统/预置）——用于关键字搜索，方便找"预置同名包"这类装不上的元凶
-                        String anyOut = adb.shell("pm list packages --user " + uid + " 2>/dev/null");
+                        String anyOut = adb.shell("pm list packages -u --user " + uid + " 2>/dev/null");
                         for (String line : anyOut.split("\n")) {
                             String t = line.trim();
                             if (t.startsWith("package:")) {
@@ -1292,7 +1315,7 @@ public class MainActivity extends Activity {
             if (shown++ >= 120) break;
             List<Integer> us = pkgUsers.get(p);
             TextView tv = new TextView(this);
-            tv.setText(p + (allPkgs.contains(p) ? "" : "   [预置/系统]")
+            tv.setText(p + (allPkgs.contains(p) ? "" : "   [预置/系统或残留记录]")
                     + (us == null || us.isEmpty() ? "" : "   [空间 " + joinInts(us) + "]"));
             tv.setTextSize(13);
             tv.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -1321,13 +1344,14 @@ public class MainActivity extends Activity {
      * INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package xxx signatures do not match previously installed version。
      * 第 1 步 `pm uninstall <pkg>`（不带 --user）才是"对所有用户卸载"。
      */
-    private void purgePackage() {
+    private void purgePackage(String explicit) {
         if (!ensureConnected()) return;
-        if (selectedPkg == null) {
-            log("请先在下方应用列表里点选一个包（可先用关键字搜索）。");
+        final String pkg = (explicit != null && explicit.length() > 0) ? explicit
+                : (selectedPkg != null ? selectedPkg : (pkgInput != null ? pkgInput.getText().toString().trim() : ""));
+        if (pkg.length() == 0) {
+            log("请先在应用列表里点选一个包，或在上面的输入框里填包名。");
             return;
         }
-        final String pkg = selectedPkg;
         setStatus("正在彻底卸载 " + pkg + " …");
         new Thread(new Runnable() {
             public void run() {
@@ -1365,12 +1389,21 @@ public class MainActivity extends Activity {
                     sb.append("· 所有用户：").append(allUsers.length() == 0 ? "无" : allUsers).append("\n");
                     sb.append("· dumpsys package 摘要：\n").append(tailOf(dump)).append("\n");
                     boolean systemCopy = sys.length() > 0 || dump.contains("system/") || dump.contains("/product/");
-                    sb.append(systemCopy
-                            ? "❗诊断：车机里存在**预置/系统**的同名应用（或残留指向 /system 的 codePath）——"
-                              + "这种包的签名记录卸载不掉，凡签名与它不同的包（我们的改造版）都装不上。"
-                              + "解决办法：给改造版**改包名**（我可以出个 com.sumsg.musichub.mod 版，与原版共存），把上面这段发我即可。"
-                            : "诊断：未发现预置同名应用；各空间已清理并复核，可直接回卡片②重装。");
-                    sb.append("\n");
+                    if (systemCopy) {
+                        sb.append("❗诊断：车机里存在**预置/系统**的同名应用（或 codePath 指向 /system）——"
+                                + "这条签名记录卸载不掉，凡签名与它不同的包都装不上。\n"
+                                + "→ 解法：给改造版**改包名**（我可出 com.sumsg.musichub.mod 版，与原版共存）。\n");
+                    } else if (listU.length() > 0) {
+                        sb.append("❗诊断：这个包名在车机上**还留着记录**（"
+                                + "已卸载但仍显示在 pm list packages -u 里 = KEEP_DATA 残留记录）。\n"
+                                + "PM 会拿这条记录里的签名来比对 → 所以卸载了也照样报签名冲突。\n"
+                                + "→ 两个解法，任选：\n"
+                                + "   A) 用**官方原版 APK** 先装一次（签名能对上）→ 再 `pm uninstall " + pkg + "` 干净卸载（**不要**带 -k）→ 残留记录即清；\n"
+                                + "   B) **改包名**（推荐，我可出 " + pkg + ".mod 版，与原版共存、彻底绕开）。\n"
+                                + "   C) 车机上执行：pm uninstall --user all " + pkg + "  （有时能连记录一起清）\n");
+                    } else {
+                        sb.append("诊断：无预置同名包、也无残留记录；各空间已清理并复核，可直接回卡片②重装。\n");
+                    }
                     setStatus(left.length() == 0 ? "已彻底卸载：" + pkg : "仍有残留：" + pkg);
                     log(sb.toString() + (left.length() == 0
                             ? "\n现在可以回卡片②重新安装改造版了。"
