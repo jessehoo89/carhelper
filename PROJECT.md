@@ -394,6 +394,29 @@ AUTH(type=1,tokenLen=20) → 已发签名(变体1); AUTH(type=1,tokenLen=20) →
 3. **心跳保活**：空闲时每 45 秒轻量 `echo k` ping 一次，发现断了就自动重连（车机休眠/热点抖动导致的断链常见）；`busy` 标志 + `adbLock` 串行化，保证心跳**绝不与用户操作同时读写同一条 socket**；
 4. **TCP keepalive**（`socket.setKeepAlive(true)`）+ 卡片①新增「**重连车机（快速，跳过扫描）**」按钮；`ensureConnected()` 也改为"先尝试自动重连，再报未连接"。
 
+
+## v1.0.13（2026-09-26 凌晨）：**"假重连"修复 —— `Socket.isConnected()` 会骗人**
+
+实机日志揭示了 v1.0.12 自动重连失效的真因：
+
+```
+[+69s] 连接被中断（Software caused connection abort）→ 自动重连并重试 …
+[+69s] 读取失败：Broken pipe        ← 重连"成功"了，却立刻又失败
+```
+
+**根因**：`Socket.isConnected()` **只表示"曾经 connect 成功过"**，对端断链后它**仍然返回 true**。
+v1.0.12 的 `reconnect()` 第一句就是 `if (adb.isConnected()) return true;` → 直接"假重连"成功返回，
+真正的 socket 早已死透 → 重试必然 `Broken pipe`；心跳也因此反复空转。
+
+**修法（双保险）**：
+1. `AdbClient` 增加 `dead` 标志：`readFully`/`send` 里任何 IOException、以及 `close()` 都置 `dead = true`，
+   `isConnected()` 先看它 → **断链后立即为 false**；`connect()` 成功时复位；
+2. `reconnect()` 不再信任任何状态判断：**无条件 `adb.close()` 掉旧连接** → 直连上次 IP → 连上后**用 `echo k` 实测验证**，
+   只有命令真的跑通才置 `connected = true`；不通过就换下一个 IP / 走完整发现流程，并在日志里写"未通过实测"；
+3. 心跳线程简化成直接 `sh("echo k")`，失败自然会走 `sh()` 内部的重连+重试链路。
+
+> 通用教训：**判断"连接是否还活着"不能看 `isConnected()`，必须发一个真实的小请求（或依赖读写异常）**。
+
 ## 待办
 
 - [x] 实机复验 v1.0.1：二次连接不再弹授权框 ✅、空间标签正确 ✅（装机失败 → 见 v1.0.2）

@@ -86,6 +86,8 @@ public class AdbClient {
     public final StringBuilder authTrace = new StringBuilder();
 
     private Socket sock;
+    /** 一旦发生 IO 错误就置位：Socket.isConnected() 在断链后仍返回 true，靠它判断会"假在线"。 */
+    private volatile boolean dead = false;
     private InputStream in;
     private OutputStream out;
     private int nextLocalId = 1;
@@ -100,6 +102,7 @@ public class AdbClient {
     }
 
     public boolean isConnected() {
+        if (dead) return false;
         return sock != null && sock.isConnected() && !sock.isClosed();
     }
 
@@ -120,6 +123,7 @@ public class AdbClient {
         out = sock.getOutputStream();
 
         pendingSync.clear();
+        dead = false;
         send(A_CNXN, 0x01000000, MAX_DATA, FEATURES.getBytes("UTF-8"));
 
         boolean pubkeySent = false;
@@ -738,6 +742,7 @@ public class AdbClient {
         } catch (IOException ignored) {
         }
         sock = null;
+        dead = true;
         pendingSync.clear();
     }
 
@@ -764,8 +769,13 @@ public class AdbClient {
         b.putInt((int) crc.getValue());
         b.putInt(cmd ^ 0xFFFFFFFF);
         b.put(d, 0, len);
-        out.write(b.array());
-        out.flush();
+        try {
+            out.write(b.array());
+            out.flush();
+        } catch (IOException e) {
+            dead = true;
+            throw e;
+        }
         if (DEBUG) {
             System.out.println("  [adb tx] " + cmdName(cmd) + " arg0=" + arg0 + " arg1=" + arg1
                     + " len=" + len + (len > 0 && len < 64 ? " data=" + new String(d, 0, len).replace("\n", "\\n") : ""));
@@ -794,10 +804,18 @@ public class AdbClient {
     private byte[] readFully(int n) throws IOException {
         byte[] buf = new byte[n];
         int off = 0;
-        while (off < n) {
-            int r = in.read(buf, off, n - off);
-            if (r < 0) throw new IOException("连接被关闭");
-            off += r;
+        try {
+            while (off < n) {
+                int r = in.read(buf, off, n - off);
+                if (r < 0) {
+                    dead = true;
+                    throw new IOException("连接被关闭");
+                }
+                off += r;
+            }
+        } catch (IOException e) {
+            dead = true;
+            throw e;
         }
         return buf;
     }

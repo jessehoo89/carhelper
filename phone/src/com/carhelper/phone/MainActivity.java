@@ -631,44 +631,52 @@ public class MainActivity extends Activity {
      */
     private boolean reconnect() {
         synchronized (adbLock) {
-        if (adb != null && adb.isConnected()) {
-            connected = true;
-            return true;
+            if (connected && adb.isConnected()) {
+                return true;
+            }
+            connected = false;
+            // 关键：不再信任 isConnected()，先无条件把旧连接彻底关掉（断链后它仍可能报 true，导致"假重连"）
+            try {
+                adb.close();
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (carIp != null && alive(carIp)) {
+                    return true;
+                }
+                wifi = CarFinder.currentWifi(this);
+                if (wifi == null) {
+                    log("重连失败：当前不是 WiFi（请确认仍连着车机热点）");
+                    return false;
+                }
+                List<String> hits = CarFinder.discover(this, wifi, 450);
+                for (String ip : hits) {
+                    if (alive(ip)) return true;
+                }
+            } catch (Exception e) {
+                log("重连失败：" + nz(e.getMessage()));
+            }
+            log("重连失败：车机 ADB 暂时不可达（可稍后点「重连车机」）");
+            return false;
         }
-        connected = false;
+    }
+
+    /** 真连一次并**用 echo 实测验证**：只有命令跑通才算连上（避免再出现"重连了却 Broken pipe"）。 */
+    private boolean alive(String ip) {
         try {
-            if (carIp != null) {
-                try {
-                    adb.close();
-                    authAsked = adb.connect(carIp, 5555, 5000, 60000);
-                    connected = true;
-                    log("已重连 " + carIp + ":5555（轨迹：" + adb.authTrace.toString() + "）");
-                    return true;
-                } catch (Exception e) {
-                    log("直连 " + carIp + " 失败：" + nz(e.getMessage()) + " → 重新发现车机 …");
-                }
-            }
-            wifi = CarFinder.currentWifi(this);
-            if (wifi == null) {
-                log("重连失败：当前不是 WiFi（请确认仍连着车机热点）");
-                return false;
-            }
-            List<String> hits = CarFinder.discover(this, wifi, 450);
-            for (String ip : hits) {
-                try {
-                    adb.close();
-                    authAsked = adb.connect(ip, 5555, 6000, 60000);
-                    carIp = ip;
-                    connected = true;
-                    log("已重连 " + ip + ":5555");
-                    return true;
-                } catch (Exception ignored) {
-                }
-            }
+            authAsked = adb.connect(ip, 5555, 5000, 60000);
+            adb.shell("echo k", 15000);
+            carIp = ip;
+            connected = true;
+            log("已重连 " + ip + ":5555（实测通过；轨迹：" + adb.authTrace.toString() + "）");
+            return true;
         } catch (Exception e) {
-            log("重连失败：" + nz(e.getMessage()));
-        }
-        return false;
+            log("连 " + ip + " 未通过实测：" + nz(e.getMessage()));
+            try {
+                adb.close();
+            } catch (Throwable ignored) {
+            }
+            return false;
         }
     }
 
@@ -684,12 +692,7 @@ public class MainActivity extends Activity {
                     }
                     if (busy || !connected) continue;
                     try {
-                        if (!adb.isConnected()) {
-                            log("[心跳] 连接已断 → 自动重连 …");
-                            reconnect();
-                        } else {
-                            sh("echo k", 15000);
-                        }
+                        sh("echo k", 15000);   // 失败会走 sh() 内部的重连+重试
                     } catch (Exception e) {
                         log("[心跳] ping 失败（" + nz(e.getMessage()) + "）→ 自动重连 …");
                         connected = false;
